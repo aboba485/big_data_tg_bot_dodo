@@ -1,0 +1,12 @@
+get-finances-sales-daily-units: {max_units: 30, max_period_days: 10, date_mode: date, from_parameter: fromDate, to_parameter: toDate, boundaries: inclusive, pagination: false}
+get-finances-sales-period-units: {max_units: 30, max_period_days: 62, date_mode: datetime, from_parameter: from, to_parameter: to, pagination: false}
+get-delivery-statistics: {max_units: 30, max_period_days: 31, date_mode: datetime, from_parameter: from, to_parameter: to, pagination: false}
+get-orders-client-statistics: {max_units: 30, max_period_days: 31, date_mode: date, from_parameter: fromDate, to_parameter: toDate, pagination: false}
+get-staff-productivity: {max_units: 30, max_period_days: 31, date_mode: datetime_hour, from_parameter: from, to_parameter: to, pagination: false}
+get-delivery-vouchers: {max_units: 30, max_period_days: 31, date_mode: datetime, from_parameter: from, to_parameter: to, pagination: true, skip_parameter: skip, take_parameter: take, page_size: 1000, end_flag_path: isEndOfListReached, items_path: vouchers}
+get-production-stop-sales-saleschannels: {max_units: 30, max_period_days: 31, date_mode: datetime, from_parameter: from, to_parameter: to, pagination: false}
+get-production-stop-sales-statistics-ingredients: {max_units: 30, max_period_days: 31, date_mode: datetime, from_parameter: from, to_parameter: to, pagination: false}
+get-production-unit-workload-by-orders: {max_units: 30, max_period_days: 14, date_mode: date, from_parameter: fromDate, to_parameter: toDate, pagination: true, skip_parameter: skip, take_parameter: take, page_size: 1000, end_flag_path: isEndOfListReached, items_path: unitWorkload}
+get-production-unit-workload-by-products: {max_units: 30, max_period_days: 14, date_mode: date, from_parameter: fromDate, to_parameter: toDate, pagination: true, skip_parameter: skip, take_parameter: take, page_size: 1000, end_flag_path: isEndOfListReached, items_path: unitWorkload}
+get-all-units: {max_units: 0, max_period_days: 0, date_mode: none, pagination: true, skip_parameter: skip, take_parameter: take, page_size: 1000, end_flag_path: isEndOfListReached, items_path: units}
+

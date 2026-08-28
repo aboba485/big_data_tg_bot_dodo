@@ -1,0 +1,13 @@
+operations:
+  - get-finances-sales-daily-units
+  - get-finances-sales-period-units
+  - get-delivery-statistics
+  - get-orders-client-statistics
+  - get-staff-productivity
+  - get-delivery-vouchers
+  - get-production-stop-sales-saleschannels
+  - get-production-stop-sales-statistics-ingredients
+  - get-production-unit-workload-by-orders
+  - get-production-unit-workload-by-products
+  - get-all-units
+

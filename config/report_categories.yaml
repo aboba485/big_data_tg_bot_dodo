@@ -1,0 +1,15 @@
+sales:
+  label: "Продажи и заказы"
+  metrics: [sales, orders_count, average_check, sales_by_channel]
+delivery:
+  label: "Доставка"
+  metrics: [delivery_sales, delivery_orders_count, average_delivery_time_seconds, average_cooking_time_seconds, average_heated_shelf_time_seconds, average_trip_time_seconds, late_orders_count, courier_app_usage_percent, orders_per_courier_hour, courier_utilization_percent, vouchers_count]
+clients:
+  label: "Клиенты"
+  metrics: [new_clients_count, dine_in_new_clients_count, delivery_takeaway_new_clients_count, old_clients_count]
+staff:
+  label: "Персонал"
+  metrics: [labor_hours, productivity_sales, sales_per_labor_hour, products_per_labor_hour, productivity_average_heated_shelf_time, staff_meals_cost]
+production:
+  label: "Производство"
+  metrics: [ingredient_stops_count, ingredient_stop_duration_hours, channel_stops_count, channel_stop_duration_hours, workload_orders_count, workload_products_count, average_order_handover_time_seconds]

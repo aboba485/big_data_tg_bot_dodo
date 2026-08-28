@@ -1,0 +1,4 @@
+interface:
+  display_name: "Coding Team"
+  short_description: "Управляемая разработка с независимыми проверками"
+  default_prompt: "Use $coding-team to implement this repository change with Explorer, Tester, and Reviewer checks."

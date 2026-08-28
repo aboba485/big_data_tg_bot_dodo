@@ -1,0 +1,15 @@
+.env
+.venv/
+.venv312/
+.deps/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest_tmp/
+.ruff_cache/
+.coverage
+htmlcov/
+data/app.db*
+data/reports/*
+!data/reports/.gitkeep
+data/units.json

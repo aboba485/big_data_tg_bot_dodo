@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Dodo IS — отчёты</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main>
+    <header><span class="badge">MVP</span><h1>Отчёты Dodo IS</h1>
+      <p>Опишите нужный отчёт обычным русским языком.</p></header>
+    <section class="card">
+      <label for="query">Запрос</label>
+      <textarea id="query" rows="5">Покажи выручку и количество заказов по дням с 1 по 10 мая 2026 по юнитам 000d3a240c719a8711e68aba13f7f862 и 000d3a240c719a8711e68aba13f7fc8a</textarea>
+      <div class="controls"><select id="format"><option value="table">Таблица</option><option value="json">JSON</option><option value="csv">CSV</option><option value="xlsx">XLSX</option></select>
+        <button id="submit">Сформировать отчёт</button></div>
+      <p class="hint">Попробуйте: «Посчитай средний чек за май 2026…»</p>
+    </section>
+    <section id="message" class="message" hidden></section>
+    <section id="result" class="card" hidden>
+      <div id="meta"></div><div class="table-wrap"><table><thead></thead><tbody></tbody></table></div>
+      <pre id="totals"></pre><a id="download" hidden>Скачать отчёт</a>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
+
