@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import logging
 import re
@@ -19,7 +20,7 @@ from app.bot.models import BotPreparation, BotReportResult
 from app.config import Settings
 from app.documentation.models import EndpointCandidate
 from app.dodo.units import UNIT_RE, UnitResolver
-from app.errors import GoogleDriveError
+from app.errors import GoogleDriveError, UnitResolutionError
 from app.google_drive.service import GoogleDriveService
 from app.planner.schemas import (
     Granularity,
@@ -58,7 +59,9 @@ SQL_MARKER = re.compile(
 UUID_RE = re.compile(
     r"\b[0-9a-fA-F]{32}\b|\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b"
 )
+ALL_UNITS_PHRASE_RE = re.compile(r"\b(?:все|всем|всех)\s+(?:заведени\w*|ресторан\w*|пиццери\w*)\b")
 logger = logging.getLogger(__name__)
+MAX_PREPARED_CONTEXTS = 256
 
 
 @dataclass
@@ -106,6 +109,7 @@ class BotReportService:
             lambda: asyncio.Semaphore(settings.telegram_max_concurrent_reports_per_user)
         )
         self._in_flight: defaultdict[int, set[str]] = defaultdict(set)
+        self._prepared_contexts: dict[tuple[int, str], tuple[float, PreparationContext]] = {}
 
     def available_reports(self, user: TelegramUser) -> list[tuple[str, str]]:
         result = []
@@ -200,6 +204,8 @@ class BotReportService:
         defer_units: bool = False,
     ) -> BotPreparation:
         context = await self._prepare_context(user, query, output_format, defer_units=defer_units)
+        if defer_units and context.public.status == "ready":
+            self._store_prepared_context(user.telegram_id, query, context)
         return context.public
 
     async def _prepare_context(
@@ -225,6 +231,10 @@ class BotReportService:
             self.user_access.ensure_unit_access(user, mentioned_units)
         except PermissionError as exc:
             raise BotAccessError(str(exc)) from exc
+        has_all_units_phrase = bool(ALL_UNITS_PHRASE_RE.search(normalize_query(query)))
+        mentioned_city_units = []
+        if defer_units and not mentioned_units and has_all_units_phrase:
+            mentioned_city_units = self._mentioned_city_unit_ids(user, query)
 
         candidates = await self.retrieval.search_endpoints(query)
         planner_result = await self.planner.create_plan(query, candidates)
@@ -292,25 +302,42 @@ class BotReportService:
             if not unit_ids:
                 raise BotInputError("Не выбраны заведения.")
             plan.unit_references = unit_ids
+        elif mentioned_units:
+            unit_ids = mentioned_units
+            plan.unit_references = unit_ids
+        elif mentioned_city_units:
+            unit_ids = mentioned_city_units
+            plan.unit_references = unit_ids
+        elif defer_units and has_all_units_phrase:
+            plan.unit_references = []
+            unit_ids = []
         elif plan.unit_references or self.orchestrator.needs_units(plan):
-            resolution = self.resolver.resolve(plan.unit_references)
-            if resolution.status != "ready":
+            try:
+                resolution = self.resolver.resolve(plan.unit_references)
+            except UnitResolutionError:
                 if not defer_units:
-                    return PreparationContext(
-                        public=BotPreparation(
-                            status="needs_clarification",
-                            question=resolution.question or "По какому подразделению нужен отчёт?",
-                            report_types=planned_report_types,
-                            date_from=plan.date_from,
-                            date_to=plan.date_to,
-                        ),
-                        plan=plan,
-                        planner_result=planner_result,
-                        candidates=candidates,
-                    )
+                    raise
+                plan.unit_references = []
                 unit_ids = []
             else:
-                unit_ids = resolution.unit_ids
+                if resolution.status != "ready":
+                    if not defer_units:
+                        return PreparationContext(
+                            public=BotPreparation(
+                                status="needs_clarification",
+                                question=resolution.question
+                                or "По какому подразделению нужен отчёт?",
+                                report_types=planned_report_types,
+                                date_from=plan.date_from,
+                                date_to=plan.date_to,
+                            ),
+                            plan=plan,
+                            planner_result=planner_result,
+                            candidates=candidates,
+                        )
+                    unit_ids = []
+                else:
+                    unit_ids = resolution.unit_ids
 
         if granularity_override is not None:
             plan.granularity = granularity_override
@@ -397,13 +424,23 @@ class BotReportService:
         async with limit:
             self._in_flight[user.telegram_id].add(fingerprint)
             try:
-                context = await self._prepare_context(
-                    user,
-                    query,
-                    output_format,
-                    unit_ids_override=selected_units or None,
-                    granularity_override=granularity,
-                )
+                context = self._take_prepared_context(user.telegram_id, query)
+                if context is not None and selected_units:
+                    context = self._apply_cached_overrides(
+                        user,
+                        context,
+                        output_format,
+                        selected_units,
+                        granularity,
+                    )
+                else:
+                    context = await self._prepare_context(
+                        user,
+                        query,
+                        output_format,
+                        unit_ids_override=selected_units or None,
+                        granularity_override=granularity,
+                    )
                 preparation = context.public
                 report_types = preparation.report_types
                 if preparation.status != "ready":
@@ -724,6 +761,112 @@ class BotReportService:
         found = list(UUID_RE.findall(query))
         found.extend(unit.unit_id for unit in self.resolver.recognize_in_query(query))
         return list(dict.fromkeys(found))
+
+    def _mentioned_city_unit_ids(self, user: TelegramUser, query: str) -> list[str]:
+        normalized = normalize_query(query)
+        if not ALL_UNITS_PHRASE_RE.search(normalized):
+            return []
+        padded_query = f" {normalized} "
+        result: list[str] = []
+        for city in self.available_unit_cities(user):
+            variants = self._city_query_variants(normalize_query(city.label))
+            if any(f" {variant} " in padded_query for variant in variants):
+                result.extend(unit_id for unit_id, _label in city.units)
+        return list(dict.fromkeys(result))
+
+    @staticmethod
+    def _city_query_variants(city: str) -> set[str]:
+        variants = {city}
+        if city.endswith("а"):
+            variants.update({f"{city[:-1]}ы", f"{city[:-1]}е"})
+        elif city.endswith("я"):
+            variants.update({f"{city[:-1]}и", f"{city[:-1]}е"})
+        elif city.endswith("ь"):
+            variants.add(f"{city[:-1]}и")
+        elif city and city[-1].isalpha():
+            variants.update({f"{city}а", f"{city}е"})
+        return variants
+
+    @staticmethod
+    def _prepared_key(telegram_id: int, query: str) -> tuple[int, str]:
+        digest = hashlib.sha256(query.strip().encode()).hexdigest()
+        return telegram_id, digest
+
+    def _store_prepared_context(
+        self, telegram_id: int, query: str, context: PreparationContext
+    ) -> None:
+        now = time.monotonic()
+        expired = [
+            key
+            for key, (expires_at, _context) in self._prepared_contexts.items()
+            if expires_at <= now
+        ]
+        for key in expired:
+            self._prepared_contexts.pop(key, None)
+        while len(self._prepared_contexts) >= MAX_PREPARED_CONTEXTS:
+            self._prepared_contexts.pop(next(iter(self._prepared_contexts)))
+        expires_at = now + self.settings.telegram_fsm_ttl_seconds
+        self._prepared_contexts[self._prepared_key(telegram_id, query)] = (
+            expires_at,
+            copy.deepcopy(context),
+        )
+
+    def _take_prepared_context(self, telegram_id: int, query: str) -> PreparationContext | None:
+        cached = self._prepared_contexts.pop(self._prepared_key(telegram_id, query), None)
+        if cached is None:
+            return None
+        expires_at, context = cached
+        if time.monotonic() >= expires_at:
+            return None
+        return context
+
+    def _apply_cached_overrides(
+        self,
+        user: TelegramUser,
+        context: PreparationContext,
+        output_format: OutputFormat,
+        unit_ids: list[str],
+        granularity: Granularity | None,
+    ) -> PreparationContext:
+        plan = context.plan
+        if plan is None or context.planner_result is None:
+            raise BotInputError("Подготовленный план отчёта отсутствует.")
+        plan.output_format = output_format
+        plan.unit_references = unit_ids
+        if granularity is not None:
+            plan.granularity = granularity
+            plan.group_by = [
+                item
+                for item in plan.group_by
+                if item not in {"day", "week", "month", "hour", "total"}
+            ]
+            if granularity != Granularity.TOTAL:
+                plan.group_by = [granularity.value, *plan.group_by]
+            for metric_id in plan.metric_ids:
+                definition = self.metrics.get(metric_id)
+                if granularity.value not in definition.granularities:
+                    raise BotInputError("Эта детализация недоступна для выбранного отчёта.")
+        if "unit" not in plan.group_by:
+            plan.group_by = [*plan.group_by, "unit"]
+        self.validator.validate(plan, context.candidates, unit_ids)
+        report_types = plan.metric_ids if plan.mode == PlanMode.METRICS else plan.operation_ids
+        try:
+            self.user_access.ensure_report_access(user, report_types)
+            self.user_access.ensure_unit_access(user, unit_ids)
+        except PermissionError as exc:
+            raise BotAccessError(str(exc)) from exc
+        if plan.date_from is not None and plan.date_to is not None:
+            self.validate_period(plan.date_from, plan.date_to)
+        context.unit_ids = unit_ids
+        context.public = BotPreparation(
+            status="ready",
+            report_types=report_types,
+            unit_ids=unit_ids,
+            date_from=plan.date_from,
+            date_to=plan.date_to,
+        )
+        context.planner_result.plan = plan
+        return context
 
     def _resolve_file(self, report_id: str) -> tuple[Path, str]:
         if not re.fullmatch(r"[0-9a-f]{32}", report_id):

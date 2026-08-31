@@ -31,7 +31,9 @@ Both transports
 button and natural-language FSM flows, Telegram presentation, file delivery, and a single-process
 weekly scheduler. Button selections create a validated plan directly, without an LLM planning
 call. Unit selection is grouped by city after applying the current user's unit permissions, so
-the hierarchy cannot widen access. `app/main.py` retains the FastAPI routes during
+the hierarchy cannot widen access. A successfully validated natural-language plan is cached
+in memory for the FSM lifetime and consumed once after button confirmation, avoiding a second
+model call; report and unit permissions are rechecked before execution. `app/main.py` retains the FastAPI routes during
 the migration. `app/report_service.py` coordinates the report use case without transport logic
 or metric formulas.
 

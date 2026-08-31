@@ -164,6 +164,7 @@ async def test_natural_request_asks_for_city_then_units_after_prepare() -> None:
     query = FakeMessage(text="Покажи выручку за июнь по ресторану")
     await natural_language_report(query, state, _user(), service)  # type: ignore[arg-type]
 
+    assert query.answers[0] == ("⏳ Разбираю запрос…", None)
     assert state.state == ReportForm.choosing_city
     assert "выберите город" in query.answers[-1][0].casefold()
     assert query.answers[-1][1] is not None

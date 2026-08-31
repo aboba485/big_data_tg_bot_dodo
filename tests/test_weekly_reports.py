@@ -247,6 +247,7 @@ async def test_weekly_query_moves_to_unit_selection() -> None:
 
     await weekly_query(message, state, user, service)  # type: ignore[arg-type]
 
+    assert message.answers[0] == ("⏳ Разбираю запрос…", None)
     assert state.state == WeeklyReportForm.choosing_city
     assert state.data["metric_id"] == "sales"
     assert state.data["unit_ids"] == ["unit-1"]

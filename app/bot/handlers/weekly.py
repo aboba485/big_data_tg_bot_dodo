@@ -112,6 +112,7 @@ async def weekly_query(
 ) -> None:
     await _ensure_active(state, bot_report_service)
     query = message.text or ""
+    await message.answer("⏳ Разбираю запрос…")
     preparation = await bot_report_service.prepare(telegram_user, query, defer_units=True)
     if preparation.status == "needs_clarification":
         await message.answer(preparation.question or "Уточните параметры отчёта.")

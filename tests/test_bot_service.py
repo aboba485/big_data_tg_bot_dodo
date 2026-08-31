@@ -97,6 +97,8 @@ async def test_run_applies_unit_and_granularity_overrides(settings) -> None:
     service = _bot_service(
         settings.model_copy(update={"default_unit_ids": [], "telegram_public_unit_ids": []})
     )
+    original_create_plan = service.planner.create_plan
+    service.planner.create_plan = AsyncMock(wraps=original_create_plan)
     preparation = await service.prepare(
         _admin(),
         "Покажи выручку за июнь 2026",
@@ -117,6 +119,7 @@ async def test_run_applies_unit_and_granularity_overrides(settings) -> None:
     assert result.response is not None
     assert "day" in (result.response.get("columns") or [])
     assert result.response.get("totals", {}).get("sales", 0) > 0
+    service.planner.create_plan.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -171,6 +174,124 @@ def test_units_are_grouped_by_city_with_natural_order_and_access_filter(settings
     restricted = _viewer(units=[second_id])
     restricted_cities = service.available_unit_cities(restricted)
     assert restricted_cities[0].units == ((second_id, "Москва 4-2"),)
+
+
+@pytest.mark.asyncio
+async def test_all_city_units_are_preselected_from_natural_query_with_access_filter(
+    settings,
+) -> None:
+    second_id = "11111111111111111111111111111111"
+    settings.unit_aliases_path.write_text(
+        f'{{"Москва 4-1":"{UNIT_ID}","Москва 4-2":"{second_id}"}}',
+        encoding="utf-8",
+    )
+    service = _bot_service(
+        settings.model_copy(update={"default_unit_ids": [], "telegram_public_unit_ids": []})
+    )
+
+    admin_result = await service.prepare(
+        _admin(),
+        "Выручка за июнь 2026 по всем заведениям Москвы",
+        defer_units=True,
+    )
+    prepositional_result = await service.prepare(
+        _admin(),
+        "Выручка за июнь 2026 по всем заведениям в Москве",
+        defer_units=True,
+    )
+    restricted_result = await service.prepare(
+        _viewer(units=[second_id]),
+        "Выручка за июнь 2026 по всем заведениям Москвы",
+        defer_units=True,
+    )
+
+    assert admin_result.status == "ready"
+    assert admin_result.unit_ids == [UNIT_ID, second_id]
+    assert prepositional_result.unit_ids == [UNIT_ID, second_id]
+    assert restricted_result.unit_ids == [second_id]
+
+
+@pytest.mark.asyncio
+async def test_exact_unit_name_is_not_expanded_to_whole_city(settings) -> None:
+    second_id = "11111111111111111111111111111111"
+    settings.unit_aliases_path.write_text(
+        f'{{"Москва 4-1":"{UNIT_ID}","Москва 4-2":"{second_id}"}}',
+        encoding="utf-8",
+    )
+    service = _bot_service(
+        settings.model_copy(update={"default_unit_ids": [], "telegram_public_unit_ids": []})
+    )
+
+    result = await service.prepare(
+        _admin(),
+        "Выручка за июнь 2026 по заведению Москва 4-1",
+        defer_units=True,
+    )
+
+    assert result.status == "ready"
+    assert result.unit_ids == [UNIT_ID]
+
+
+@pytest.mark.asyncio
+async def test_unknown_planned_unit_falls_back_to_buttons_when_units_are_deferred(
+    settings,
+) -> None:
+    service = _bot_service(
+        settings.model_copy(update={"default_unit_ids": [], "telegram_public_unit_ids": []})
+    )
+    service.planner.create_plan = AsyncMock(
+        return_value=PlannerResult(
+            plan=ReportPlan(
+                status=PlanStatus.READY,
+                metric_ids=["sales"],
+                operation_ids=["get-finances-sales-daily-units"],
+                date_from=date(2026, 6, 1),
+                date_to=date(2026, 6, 30),
+                unit_references=["Пермь 1"],
+            )
+        )
+    )
+
+    result = await service.prepare(
+        _admin(),
+        "Выручка за июнь 2026 по заведению Пермь 1",
+        defer_units=True,
+    )
+
+    assert result.status == "ready"
+    assert result.unit_ids == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_city_cannot_expand_planner_all_to_every_unit(settings) -> None:
+    settings.unit_aliases_path.write_text(
+        f'{{"Москва 4-1":"{UNIT_ID}"}}',
+        encoding="utf-8",
+    )
+    service = _bot_service(
+        settings.model_copy(update={"default_unit_ids": [], "telegram_public_unit_ids": []})
+    )
+    service.planner.create_plan = AsyncMock(
+        return_value=PlannerResult(
+            plan=ReportPlan(
+                status=PlanStatus.READY,
+                metric_ids=["sales"],
+                operation_ids=["get-finances-sales-daily-units"],
+                date_from=date(2026, 6, 1),
+                date_to=date(2026, 6, 30),
+                unit_references=["all"],
+            )
+        )
+    )
+
+    result = await service.prepare(
+        _admin(),
+        "Выручка за июнь 2026 по всем заведениям Перми",
+        defer_units=True,
+    )
+
+    assert result.status == "ready"
+    assert result.unit_ids == []
 
 
 def test_unit_without_city_is_grouped_separately(settings) -> None:

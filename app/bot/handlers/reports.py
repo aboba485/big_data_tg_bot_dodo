@@ -466,6 +466,7 @@ async def natural_language_report(
     bot_report_service: BotReportService,
 ) -> None:
     query = message.text or ""
+    await message.answer("⏳ Разбираю запрос…")
     preparation = await bot_report_service.prepare(telegram_user, query, defer_units=True)
     if preparation.status == "needs_clarification":
         await state.set_state(ReportForm.clarification)
