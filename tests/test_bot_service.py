@@ -93,6 +93,26 @@ async def test_prepare_can_defer_missing_units(settings) -> None:
 
 
 @pytest.mark.asyncio
+async def test_prepare_asks_for_period_when_only_date_from_is_set(settings) -> None:
+    service = _bot_service(settings)
+    plan = ReportPlan(
+        status=PlanStatus.READY,
+        metric_ids=["sales"],
+        operation_ids=["get-finances-sales-daily-units"],
+        date_from=date(2026, 6, 1),
+        unit_references=[UNIT_ID],
+    )
+    service.planner.create_plan = AsyncMock(return_value=PlannerResult(plan=plan))
+    preparation = await service.prepare(
+        _admin(),
+        f"Покажи выручку с 1 июня по юниту {UNIT_ID}",
+    )
+
+    assert preparation.status == "needs_clarification"
+    assert preparation.question == "За какой период нужен отчёт?"
+
+
+@pytest.mark.asyncio
 async def test_run_applies_unit_and_granularity_overrides(settings) -> None:
     service = _bot_service(
         settings.model_copy(update={"default_unit_ids": [], "telegram_public_unit_ids": []})
@@ -372,7 +392,8 @@ async def test_selected_report_can_split_by_day(settings) -> None:
     assert "day" in columns
     assert len(rows) == 3
     assert "Смоленск" in result.text or UNIT_ID[:8] in result.text
-    assert "2026-06-01" in result.text
+    assert "01.06.2026" in result.text
+    assert "2026-06-01" not in result.text
 
 
 @pytest.mark.asyncio
@@ -408,7 +429,9 @@ def test_response_text_includes_day_bucket_in_location(settings) -> None:
         }
     )
 
-    assert "Смоленск-1 / 2026-06-01: sales=100" in text
+    assert "01.06.2026" in text
+    assert "Смоленск-1: 100" in text
+    assert "Смоленск-1 / 2026-06-01: sales=100" not in text
 
 
 @pytest.mark.asyncio
@@ -750,10 +773,10 @@ def test_response_text_shows_units_before_totals(settings) -> None:
         }
     )
 
-    assert "Смоленск-1: sales=100" in text
-    assert "Смоленск-2: sales=200" in text
+    assert "Смоленск-1: 100" in text
+    assert "Смоленск-2: 200" in text
     assert text.index("Смоленск-1") < text.index("Итого")
-    assert "Итого: sales=300" in text
+    assert "Итого: 300" in text
 
 
 def test_response_text_includes_sales_channel_in_location(settings) -> None:
@@ -780,6 +803,6 @@ def test_response_text_includes_sales_channel_in_location(settings) -> None:
         }
     )
 
-    assert "Смоленск-1 / Delivery: sales_by_channel=100" in text
-    assert "Смоленск-1 / Dine-in: sales_by_channel=200" in text
-    assert "Итого: sales_by_channel=300" in text
+    assert "Смоленск-1 / Delivery: 100" in text
+    assert "Смоленск-1 / Dine-in: 200" in text
+    assert "Итого: 300" in text

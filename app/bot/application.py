@@ -86,7 +86,12 @@ async def global_error_handler(event: ErrorEvent) -> bool:
         )
     else:
         error_code = f"RPT-{secrets.token_hex(3).upper()}"
-        text = GENERIC_ERROR.format(error_code=error_code)
+        reason = (
+            error.message
+            if isinstance(error, ApplicationError)
+            else ApplicationError.public_message
+        )
+        text = GENERIC_ERROR.format(error_code=error_code, reason=reason)
         logger.exception(
             "bot_unhandled_error telegram_id=%s error_code=%s application_code=%s",
             telegram_id,

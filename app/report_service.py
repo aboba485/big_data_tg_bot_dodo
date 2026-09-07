@@ -14,6 +14,7 @@ from app.planner.schemas import OutputFormat, PlanMode, PlanStatus, ReportPlan
 from app.planner.service import PlannerService
 from app.planner.validator import ReportPlanValidator
 from app.reports.exporters import export_csv, export_xlsx
+from app.reports.matrix import period_label_from_dates
 from app.reports.service import ReportAggregator, ReportResult
 from app.retrieval.service import RetrievalService
 from app.storage.generated_files import GeneratedFileRepository
@@ -295,9 +296,9 @@ class ReportOrchestrator:
     def _export(
         self,
         request_id: str,
-        query: str,
+        _query: str,
         plan: Any,
-        unit_ids: list[str],
+        _unit_ids: list[str],
         columns: list[str],
         rows: list[dict[str, Any]],
         totals: dict[str, Any],
@@ -307,20 +308,13 @@ class ReportOrchestrator:
         report_id = uuid.uuid4().hex
         suffix = plan.output_format.value
         path = self.settings.reports_directory / f"{report_id}.{suffix}"
+        period_label = period_label_from_dates(plan.date_from, plan.date_to)
         try:
             if plan.output_format == OutputFormat.CSV:
-                export_csv(path, columns, rows, totals)
+                export_csv(path, columns, rows, totals, period_label=period_label)
                 media_type = "text/csv"
             else:
-                export_xlsx(
-                    path,
-                    query=query,
-                    plan=plan,
-                    unit_ids=unit_ids,
-                    columns=columns,
-                    rows=rows,
-                    totals=totals,
-                )
+                export_xlsx(path, columns, rows, totals, period_label=period_label)
                 media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             self.files.add(report_id, request_id, path, media_type)
         except Exception:

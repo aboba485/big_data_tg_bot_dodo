@@ -150,7 +150,9 @@ class ReportPlanValidator:
         if plan.dynamic_aggregation is not None or plan.raw_collection:
             raise PlanValidationError("Metrics-режим содержит поля другого режима")
         if not plan.date_from or not plan.date_to:
-            raise PlanValidationError("В плане отсутствует период")
+            plan.status = PlanStatus.NEEDS_CLARIFICATION
+            plan.clarification_question = "За какой период нужен отчёт?"
+            return plan
         if plan.date_from > plan.date_to:
             raise PlanValidationError("Начало периода находится после конца")
         if plan.date_to > date.today() + timedelta(days=366 * 5):
@@ -226,7 +228,9 @@ class ReportPlanValidator:
                         plan, candidates, resolved_unit_ids, profile
                     )
             if profile.has_period and not (plan.date_from and plan.date_to):
-                raise PlanValidationError("В плане отсутствует период")
+                plan.status = PlanStatus.NEEDS_CLARIFICATION
+                plan.clarification_question = "За какой период нужен отчёт?"
+                return plan
             if (
                 agg.collection
                 and profile.collection_candidates

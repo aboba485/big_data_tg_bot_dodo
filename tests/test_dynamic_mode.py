@@ -269,6 +269,16 @@ def test_validator_accepts_dynamic_plan(repository, dynamic_settings) -> None:
     assert validated.mode == PlanMode.DYNAMIC
 
 
+def test_dynamic_plan_without_dates_asks_for_period(repository, dynamic_settings) -> None:
+    plan = _dynamic_plan(date_from=None, date_to=None)
+    validated = _validator(repository, dynamic_settings).validate(
+        plan, _candidates(repository, "get-delivery-statistics"), [UNIT_ID]
+    )
+    assert validated.status == PlanStatus.NEEDS_CLARIFICATION
+    assert validated.clarification_question == "За какой период нужен отчёт?"
+    assert validated.mode == PlanMode.DYNAMIC
+
+
 def test_validator_normalizes_documented_dynamic_field_path(repository, dynamic_settings) -> None:
     plan = _dynamic_plan(
         operation_ids=["get-dough-consumption"],

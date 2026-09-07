@@ -34,6 +34,12 @@ from app.planner.service import PlannerService
 from app.planner.validator import ReportPlanValidator
 from app.report_service import ReportOrchestrator
 from app.reports.exporters import export_csv
+from app.reports.matrix import (
+    TOTAL_LABEL,
+    build_matrix,
+    is_total_label,
+    period_label_from_dates,
+)
 from app.reports.metric_registry import MetricRegistry
 from app.retrieval.normalizer import normalize_query
 from app.retrieval.service import RetrievalService
@@ -379,7 +385,20 @@ class BotReportService:
         if plan.date_from is not None and plan.date_to is not None:
             self.validate_period(plan.date_from, plan.date_to)
         elif plan.date_from is not None or plan.date_to is not None:
-            raise BotInputError("Не удалось определить полный период отчёта.")
+            return PreparationContext(
+                public=BotPreparation(
+                    status="needs_clarification",
+                    question="За какой период нужен отчёт?",
+                    report_types=planned_report_types,
+                    unit_ids=unit_ids,
+                    date_from=plan.date_from,
+                    date_to=plan.date_to,
+                ),
+                plan=plan,
+                planner_result=planner_result,
+                candidates=candidates,
+                unit_ids=unit_ids,
+            )
         try:
             self.user_access.ensure_report_access(user, planned_report_types)
             if unit_ids:
@@ -655,11 +674,7 @@ class BotReportService:
     @staticmethod
     def _period_label(response: dict[str, Any]) -> str | None:
         plan = response.get("plan") or {}
-        date_from = plan.get("date_from")
-        date_to = plan.get("date_to")
-        if date_from and date_to:
-            return f"{date_from} — {date_to}"
-        return None
+        return period_label_from_dates(plan.get("date_from"), plan.get("date_to"))
 
     def cleanup_file(self, report_id: str) -> None:
         try:
@@ -694,6 +709,14 @@ class BotReportService:
         totals = response.get("totals") or {}
         if not rows or not columns:
             return summary
+        matrix = build_matrix(
+            list(columns),
+            list(rows),
+            dict(totals),
+            period_label=self._period_label(response),
+        )
+        if matrix is not None:
+            return self._format_matrix_text(summary, matrix)
         lines = [summary, ""]
         limit = self.settings.telegram_max_message_rows
         dimension_columns = {
@@ -748,6 +771,26 @@ class BotReportService:
             if not total_parts:
                 total_parts = [f"{key}={value}" for key, value in totals.items()]
             lines.extend(["", f"Итого: {', '.join(total_parts)}"])
+        return "\n".join(lines)
+
+    def _format_matrix_text(self, summary: str, matrix: list[list[Any]]) -> str:
+        header = matrix[0] if matrix else []
+        dates = header[1:]
+        lines = [summary]
+        if dates:
+            lines.append(" | ".join(str(item) for item in dates))
+        limit = self.settings.telegram_max_message_rows
+        body = [row for row in matrix[1:] if row and not is_total_label(row[0])]
+        totals = [row for row in matrix[1:] if row and is_total_label(row[0])]
+        for row in body[:limit]:
+            values = " | ".join("" if item is None else str(item) for item in row[1:])
+            lines.append(f"{row[0]}: {values}")
+        if len(body) > limit:
+            lines.append(f"… ещё строк: {len(body) - limit}")
+        for row in totals:
+            values = " | ".join("" if item is None else str(item) for item in row[1:])
+            label = row[0] or TOTAL_LABEL
+            lines.append(f"{label}: {values}")
         return "\n".join(lines)
 
     @staticmethod
@@ -892,6 +935,7 @@ class BotReportService:
                 list(response.get("columns") or []),
                 list(response.get("rows") or []),
                 dict(response.get("totals") or {}),
+                period_label=self._period_label(response),
             )
             self.files.add(
                 report_id,

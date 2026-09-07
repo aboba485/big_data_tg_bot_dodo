@@ -82,6 +82,67 @@ def test_mock_planner_ready_and_clarification() -> None:
     assert clarification.status == PlanStatus.NEEDS_CLARIFICATION
 
 
+def test_metrics_plan_without_dates_asks_for_period(settings) -> None:
+    repository = _repository(settings)
+    validator = ReportPlanValidator(
+        MetricRegistry(),
+        repository,
+        settings.allowed_operations,
+        allow_all_get=True,
+    )
+    operation_id = "get-finances-sales-daily-units"
+    plan = ReportPlan(
+        status=PlanStatus.READY,
+        metric_ids=["sales"],
+        operation_ids=[operation_id],
+        unit_references=[UNIT_ID],
+    )
+    validated = validator.validate(
+        plan,
+        [
+            EndpointCandidate(
+                operation_id=operation_id,
+                score=1,
+                compact_summary="sales",
+            )
+        ],
+        [UNIT_ID],
+    )
+    assert validated.status == PlanStatus.NEEDS_CLARIFICATION
+    assert validated.clarification_question == "За какой период нужен отчёт?"
+
+
+def test_metrics_plan_with_only_date_from_asks_for_period(settings) -> None:
+    repository = _repository(settings)
+    validator = ReportPlanValidator(
+        MetricRegistry(),
+        repository,
+        settings.allowed_operations,
+        allow_all_get=True,
+    )
+    operation_id = "get-finances-sales-daily-units"
+    plan = ReportPlan(
+        status=PlanStatus.READY,
+        metric_ids=["sales"],
+        operation_ids=[operation_id],
+        date_from=date(2026, 6, 1),
+        unit_references=[UNIT_ID],
+    )
+    validated = validator.validate(
+        plan,
+        [
+            EndpointCandidate(
+                operation_id=operation_id,
+                score=1,
+                compact_summary="sales",
+            )
+        ],
+        [UNIT_ID],
+    )
+    assert validated.status == PlanStatus.NEEDS_CLARIFICATION
+    assert validated.clarification_question == "За какой период нужен отчёт?"
+
+
 def test_report_filter_schema_rejects_unit_filter() -> None:
     with pytest.raises(ValueError):
         ReportFilter(name="unitName", values=["Подольск-1"])  # type: ignore[arg-type]

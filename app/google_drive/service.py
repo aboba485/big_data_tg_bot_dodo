@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -13,6 +12,7 @@ from cryptography.fernet import Fernet, InvalidToken
 
 from app.config import Settings
 from app.errors import ConfigurationError, GoogleDriveError, GoogleDriveNotLinkedError
+from app.reports.matrix import TOTAL_LABEL, build_table, is_total_label
 from app.storage.google_drive import GoogleDriveLinkRepository, OAuthStateRepository
 
 AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -27,11 +27,6 @@ SHEET_TITLE = "Отчёт"
 VALUES_CHUNK_ROWS = 2000
 ACCESS_TOKEN_LEEWAY_SECONDS = 60
 REQUEST_TIMEOUT_SECONDS = 30.0
-TOTAL_LABEL = "Итого"
-TIME_FIELDS = ("hour", "day", "week", "month")
-ENTITY_FIELDS = ("unitName", "unit_name", "unitId", "unit_id")
-EXTRA_FIELDS = ("salesChannel", "ingredient", "ingredientCategory", "stopReason")
-DIMENSION_FIELDS = frozenset((*TIME_FIELDS, *ENTITY_FIELDS, *EXTRA_FIELDS))
 
 logger = logging.getLogger(__name__)
 
@@ -295,16 +290,7 @@ class GoogleDriveService:
                 f"В отчёте {len(rows)} строк, а в Google Sheets выгружается не более "
                 f"{self.settings.google_sheets_max_rows}. Выберите формат CSV или XLSX."
             )
-        matrix = _build_matrix(columns, rows, totals, period_label=period_label)
-        if matrix is not None:
-            return matrix
-        values: list[list[Any]] = [[str(column) for column in columns]]
-        values.extend([_cell(row.get(column)) for column in columns] for row in rows)
-        if totals:
-            total_row = [_cell(totals.get(column)) for column in columns]
-            total_row[0] = TOTAL_LABEL
-            values.append(total_row)
-        return values
+        return build_table(columns, rows, totals, period_label=period_label)
 
     async def _access_token(self, telegram_id: int) -> str:
         link = self.links.get(telegram_id)
@@ -521,82 +507,8 @@ def _values_range(cell: str) -> str:
     return quote(f"'{SHEET_TITLE}'!{cell}", safe="")
 
 
-def _cell(value: Any) -> Any:
-    if value is None:
-        return ""
-    if isinstance(value, (bool, str)):
-        return value
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else str(value)
-    return str(value)
-
-
 def _is_matrix(values: list[list[Any]]) -> bool:
     return bool(values) and (not values[0] or values[0][0] in {"", None})
-
-
-def _build_matrix(
-    columns: list[str],
-    rows: list[dict[str, Any]],
-    totals: dict[str, Any] | None = None,
-    *,
-    period_label: str | None = None,
-) -> list[list[Any]] | None:
-    value_fields = [column for column in columns if column not in DIMENSION_FIELDS]
-    has_entity = any(field in columns for field in ENTITY_FIELDS)
-    if not value_fields or not has_entity:
-        return None
-
-    metric = value_fields[0]
-    default_header = _period_header(period_label) or str(metric)
-    date_order: list[str] = []
-    date_seen: set[str] = set()
-    unit_order: list[str] = []
-    unit_seen: set[str] = set()
-    cells: dict[tuple[str, str], Any] = {}
-
-    for row in rows:
-        unit = _row_label(row)
-        date_header = _row_date_header(row) or default_header
-        if unit not in unit_seen:
-            unit_seen.add(unit)
-            unit_order.append(unit)
-        if date_header not in date_seen:
-            date_seen.add(date_header)
-            date_order.append(date_header)
-        cells[(unit, date_header)] = _cell(row.get(metric))
-
-    if not date_order:
-        date_order = [default_header]
-    if not unit_order:
-        unit_order = ["Все заведения"]
-
-    header: list[Any] = ["", *date_order]
-    values: list[list[Any]] = [header]
-    column_totals = [0.0] * len(date_order)
-    has_numeric = [False] * len(date_order)
-    for unit in unit_order:
-        line: list[Any] = [unit]
-        for index, date_header in enumerate(date_order):
-            value = cells.get((unit, date_header), "")
-            line.append(value)
-            number = _numeric(value)
-            if number is not None:
-                column_totals[index] += number
-                has_numeric[index] = True
-        values.append(line)
-
-    total_row: list[Any] = [TOTAL_LABEL]
-    report_totals = totals or {}
-    if len(date_order) == 1 and metric in report_totals:
-        total_row.append(_cell(report_totals.get(metric)))
-    else:
-        for index, total in enumerate(column_totals):
-            total_row.append(round(total, 2) if has_numeric[index] else "")
-    values.append(total_row)
-    return values
 
 
 def _merge_matrices(existing: list[list[Any]], incoming: list[list[Any]]) -> list[list[Any]]:
@@ -618,7 +530,7 @@ def _merge_matrices(existing: list[list[Any]], incoming: list[list[Any]]) -> lis
             if not row:
                 continue
             unit = str(row[0] or "").strip()
-            if not unit or unit == TOTAL_LABEL:
+            if not unit or is_total_label(unit):
                 continue
             if unit not in unit_seen:
                 unit_seen.add(unit)
@@ -654,7 +566,7 @@ def _totals_by_date(matrix: list[list[Any]]) -> dict[str, Any]:
         return {}
     dates = [str(value) for value in matrix[0][1:]]
     for row in reversed(matrix[1:]):
-        if row and str(row[0] or "").strip() == TOTAL_LABEL:
+        if row and is_total_label(str(row[0] or "").strip()):
             result: dict[str, Any] = {}
             for index, date_header in enumerate(dates):
                 if index + 1 < len(row):
@@ -675,66 +587,3 @@ def _overwrite_bounds(merged: list[list[Any]], existing: list[list[Any]]) -> lis
     while len(padded) < existing_rows:
         padded.append([""] * columns)
     return padded
-
-
-def _row_label(row: dict[str, Any]) -> str:
-    name = ""
-    for field in ENTITY_FIELDS:
-        name = str(row.get(field) or "").strip()
-        if name:
-            break
-    extras = [
-        str(row.get(field) or "").strip()
-        for field in EXTRA_FIELDS
-        if str(row.get(field) or "").strip()
-    ]
-    parts = [part for part in [name, *extras] if part]
-    return " / ".join(parts) or "Все заведения"
-
-
-def _row_date_header(row: dict[str, Any]) -> str:
-    for field in TIME_FIELDS:
-        raw = row.get(field)
-        if raw not in {None, ""}:
-            return _format_date_header(raw)
-    return ""
-
-
-def _period_header(period_label: str | None) -> str:
-    if not period_label:
-        return ""
-    text = period_label.strip()
-    for separator in (" — ", " – ", " - "):
-        if separator in text:
-            text = text.rsplit(separator, 1)[-1].strip()
-            break
-    return _format_date_header(text) or text
-
-
-def _format_date_header(value: Any) -> str:
-    text = str(value).strip()
-    if not text:
-        return ""
-    if "T" in text:
-        date_part, time_part = text.split("T", 1)
-        formatted = _iso_date_to_display(date_part)
-        hour = time_part[:5] if len(time_part) >= 5 else ""
-        return f"{formatted} {hour}".strip() if formatted else text
-    formatted = _iso_date_to_display(text[:10])
-    return formatted or text
-
-
-def _iso_date_to_display(value: str) -> str:
-    try:
-        return datetime.strptime(value, "%Y-%m-%d").strftime("%d.%m.%Y")
-    except ValueError:
-        return ""
-
-
-def _numeric(value: Any) -> float | None:
-    if isinstance(value, bool) or value in {"", None}:
-        return None
-    if isinstance(value, (int, float)):
-        number = float(value)
-        return number if math.isfinite(number) else None
-    return None
