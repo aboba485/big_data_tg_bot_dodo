@@ -9,7 +9,7 @@ import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -22,8 +22,8 @@ from app.documentation.models import EndpointCandidate
 from app.dodo.channels import (
     DEFAULT_SALES_CHANNELS,
     SALES_CHANNEL_FILTER,
-    SALES_CHANNEL_GROUP,
     canonical_sales_channel,
+    sales_channel_intent,
     sales_channel_label,
 )
 from app.dodo.units import UNIT_RE, UnitResolver
@@ -73,6 +73,31 @@ UUID_RE = re.compile(
     r"\b[0-9a-fA-F]{32}\b|\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b"
 )
 ALL_UNITS_PHRASE_RE = re.compile(r"\b(?:все|всем|всех)\s+(?:заведени\w*|ресторан\w*|пиццери\w*)\b")
+GRANULARITY_PATTERNS = (
+    (Granularity.HOUR, re.compile(r"\b(?:по\s+час\w*|почасов\w*|hourly)\b")),
+    (Granularity.DAY, re.compile(r"\b(?:по\s+дн\w*|daily)\b")),
+    (Granularity.WEEK, re.compile(r"\b(?:по\s+недел\w*|weekly)\b")),
+    (Granularity.MONTH, re.compile(r"\b(?:по\s+месяц\w*|monthly)\b")),
+    (
+        Granularity.TOTAL,
+        re.compile(r"\b(?:без\s+разбивк\w*|общ(?:ий|им)\s+итог\w*|итогом|total)\b"),
+    ),
+)
+OUTPUT_FORMAT_PATTERNS = (
+    (
+        OutputFormat.SHEETS,
+        re.compile(r"\b(?:google\s+sheets|гугл\w*\s+таблиц\w*)\b"),
+    ),
+    (OutputFormat.XLSX, re.compile(r"\b(?:xlsx|excel|эксел\w*)\b")),
+    (OutputFormat.CSV, re.compile(r"\bcsv\b")),
+    (
+        OutputFormat.TABLE,
+        re.compile(
+            r"\b(?:текст|текстом|текстов\w*\s+формат\w*|в\s+виде\s+текст\w*|"
+            r"в\s+сообщении|обычн\w*\s+таблиц\w*|table)\b"
+        ),
+    ),
+)
 logger = logging.getLogger(__name__)
 MAX_PREPARED_CONTEXTS = 256
 
@@ -215,9 +240,16 @@ class BotReportService:
         output_format: OutputFormat | None = None,
         *,
         defer_units: bool = False,
+        for_schedule: bool = False,
     ) -> BotPreparation:
-        context = await self._prepare_context(user, query, output_format, defer_units=defer_units)
-        if defer_units and context.public.status == "ready":
+        context = await self._prepare_context(
+            user,
+            query,
+            output_format,
+            defer_units=defer_units,
+            for_schedule=for_schedule,
+        )
+        if defer_units and not for_schedule and context.public.status == "ready":
             self._store_prepared_context(user.telegram_id, query, context)
         return context.public
 
@@ -228,6 +260,7 @@ class BotReportService:
         output_format: OutputFormat | None = None,
         *,
         defer_units: bool = False,
+        for_schedule: bool = False,
         unit_ids_override: list[str] | None = None,
         granularity_override: Granularity | None = None,
         sales_channel_choice_override: str | None = None,
@@ -249,11 +282,26 @@ class BotReportService:
         mentioned_city_units = []
         if defer_units and not mentioned_units and has_all_units_phrase:
             mentioned_city_units = self._mentioned_city_unit_ids(user, query)
+        units_specified = bool(mentioned_units or mentioned_city_units)
 
         candidates = await self.retrieval.search_endpoints(query)
         planner_result = await self.planner.create_plan(query, candidates)
         plan = planner_result.plan
         self.validator.apply_query_intent(plan, query)
+        explicit_granularity = self._explicit_granularity(query)
+        explicit_output_format = self._explicit_output_format(query)
+        explicit_sales_channel = self._explicit_sales_channel_choice(query)
+        if explicit_granularity is not None:
+            plan.granularity = explicit_granularity
+            plan.group_by = [
+                item
+                for item in plan.group_by
+                if item not in {"day", "week", "month", "hour", "total"}
+            ]
+            if explicit_granularity != Granularity.TOTAL:
+                plan.group_by = [explicit_granularity.value, *plan.group_by]
+        if output_format is None and explicit_output_format is not None:
+            plan.output_format = explicit_output_format
         if sales_channel_choice_override is not None and plan.status == PlanStatus.READY:
             self.validator.apply_sales_channel_choice(plan, sales_channel_choice_override)
         planned_report_types = (
@@ -265,6 +313,11 @@ class BotReportService:
             raise BotAccessError(str(exc)) from exc
         if output_format is not None:
             plan.output_format = output_format
+        if for_schedule and (plan.date_from is None or plan.date_to is None):
+            today = date.today()
+            this_monday = today - timedelta(days=today.weekday())
+            plan.date_from = this_monday - timedelta(days=7)
+            plan.date_to = this_monday - timedelta(days=1)
         if plan.status == PlanStatus.NEEDS_CLARIFICATION:
             question = (plan.clarification_question or "").casefold()
             asks_for_unit = any(
@@ -277,7 +330,9 @@ class BotReportService:
                 and plan.date_to is not None
                 and (defer_units or bool(unit_ids_override))
             )
-            if can_defer_units:
+            asks_for_period = any(marker in question for marker in ("период", "дат"))
+            can_defer_period = for_schedule and asks_for_period and bool(planned_report_types)
+            if can_defer_units or can_defer_period:
                 plan.status = PlanStatus.READY
                 plan.clarification_question = None
                 if plan.mode == PlanMode.METRICS and plan.metric_ids:
@@ -288,6 +343,7 @@ class BotReportService:
                             if self.metrics.has(metric_id)
                         )
                     )
+                self.validator.apply_query_intent(plan, query)
             else:
                 return PreparationContext(
                     public=BotPreparation(
@@ -296,6 +352,11 @@ class BotReportService:
                         report_types=planned_report_types,
                         date_from=plan.date_from,
                         date_to=plan.date_to,
+                        granularity=plan.granularity,
+                        output_format=plan.output_format,
+                        units_specified=units_specified,
+                        granularity_specified=explicit_granularity is not None,
+                        output_format_specified=explicit_output_format is not None,
                     ),
                     plan=plan,
                     planner_result=planner_result,
@@ -386,6 +447,11 @@ class BotReportService:
                     unit_ids=unit_ids,
                     date_from=plan.date_from,
                     date_to=plan.date_to,
+                    granularity=plan.granularity,
+                    output_format=plan.output_format,
+                    units_specified=units_specified,
+                    granularity_specified=explicit_granularity is not None,
+                    output_format_specified=explicit_output_format is not None,
                 ),
                 plan=plan,
                 planner_result=planner_result,
@@ -422,7 +488,15 @@ class BotReportService:
                 unit_ids=unit_ids,
                 date_from=plan.date_from,
                 date_to=plan.date_to,
-                **self._sales_channel_preparation(plan),
+                granularity=plan.granularity,
+                output_format=plan.output_format,
+                units_specified=units_specified,
+                granularity_specified=explicit_granularity is not None,
+                output_format_specified=explicit_output_format is not None,
+                **self._sales_channel_preparation(
+                    plan,
+                    explicit_choice=explicit_sales_channel,
+                ),
             ),
             plan=plan,
             planner_result=planner_result,
@@ -832,6 +906,28 @@ class BotReportService:
         found.extend(unit.unit_id for unit in self.resolver.recognize_in_query(query))
         return list(dict.fromkeys(found))
 
+    @staticmethod
+    def _explicit_granularity(query: str) -> Granularity | None:
+        normalized = normalize_query(query)
+        matches = {value for value, pattern in GRANULARITY_PATTERNS if pattern.search(normalized)}
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    @staticmethod
+    def _explicit_output_format(query: str) -> OutputFormat | None:
+        normalized = normalize_query(query)
+        matches = {value for value, pattern in OUTPUT_FORMAT_PATTERNS if pattern.search(normalized)}
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    @staticmethod
+    def _explicit_sales_channel_choice(query: str) -> str | None:
+        intent = sales_channel_intent(query)
+        choices = list(intent.values)
+        if intent.split:
+            choices.append("split")
+        if intent.all_together:
+            choices.append("all")
+        return choices[0] if len(choices) == 1 else None
+
     def _mentioned_city_unit_ids(self, user: TelegramUser, query: str) -> list[str]:
         normalized = normalize_query(query)
         if not ALL_UNITS_PHRASE_RE.search(normalized):
@@ -937,24 +1033,33 @@ class BotReportService:
             unit_ids=unit_ids,
             date_from=plan.date_from,
             date_to=plan.date_to,
-            **self._sales_channel_preparation(plan),
+            granularity=plan.granularity,
+            output_format=plan.output_format,
+            units_specified=context.public.units_specified,
+            granularity_specified=context.public.granularity_specified,
+            output_format_specified=context.public.output_format_specified,
+            **self._sales_channel_preparation(
+                plan,
+                explicit_choice=(
+                    context.public.sales_channel_selection
+                    if context.public.sales_channel_specified
+                    else None
+                ),
+            ),
         )
         context.planner_result.plan = plan
         return context
 
-    def _sales_channel_preparation(self, plan: ReportPlan) -> dict[str, Any]:
+    def _sales_channel_preparation(
+        self,
+        plan: ReportPlan,
+        *,
+        explicit_choice: str | None = None,
+    ) -> dict[str, Any]:
         capability = self.validator.sales_channel_capability(plan)
         if capability is None:
             return {}
-        selected = next(
-            (
-                value
-                for report_filter in plan.filters
-                if report_filter.name == SALES_CHANNEL_FILTER
-                for value in report_filter.values
-            ),
-            "split" if SALES_CHANNEL_GROUP in plan.group_by else "",
-        )
+        selected = explicit_choice or ""
         suggested = [
             value
             for default in DEFAULT_SALES_CHANNELS
@@ -965,7 +1070,9 @@ class BotReportService:
             "sales_channel_options": suggested,
             "sales_channel_can_split": capability.can_group,
             "sales_channel_selection": selected,
+            "sales_channel_specified": explicit_choice is not None,
         }
+
     def _resolve_file(self, report_id: str) -> tuple[Path, str]:
         if not re.fullmatch(r"[0-9a-f]{32}", report_id):
             raise BotInputError("Некорректный идентификатор файла отчёта.")

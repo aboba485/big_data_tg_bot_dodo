@@ -190,7 +190,7 @@ async def units_action_callback(
             unit_labels=labels,
             unit_label=", ".join(labels.get(unit_id, unit_id) for unit_id in selected),
         )
-        await _ask_granularity(callback.message, state, bot_report_service)
+        await _advance_natural_flow(callback.message, state, telegram_user, bot_report_service)
         return
 
     await callback.answer()
@@ -223,12 +223,7 @@ async def choose_granularity_callback(
         granularity=granularity.value,
         granularity_label=GRANULARITY_LABELS.get(granularity.value, granularity.value),
     )
-    await _ask_channel_or_format(
-        callback.message,
-        state,
-        telegram_user,
-        bot_report_service,
-    )
+    await _advance_natural_flow(callback.message, state, telegram_user, bot_report_service)
 
 
 @router.callback_query(ReportForm.choosing_channel, F.data.startswith("report:channel:"))
@@ -255,7 +250,7 @@ async def choose_sales_channel_callback(
         else sales_channel_label(choice)
     )
     await state.update_data(sales_channel_choice=choice, sales_channel_label=label)
-    await _ask_format(callback.message, state, telegram_user, bot_report_service)
+    await _advance_natural_flow(callback.message, state, telegram_user, bot_report_service)
 
 
 @router.callback_query(ReportForm.choosing_format, F.data.startswith("report:format:"))
@@ -528,9 +523,10 @@ async def _ask_units(
     if not units:
         raise BotInputError("Для вашего профиля не настроены доступные заведения.")
     available = dict(units)
-    preselected = [unit_id for unit_id in preparation.unit_ids if unit_id in available]
+    if any(unit_id not in available for unit_id in preparation.unit_ids):
+        raise BotInputError("Одно из указанных заведений недоступно.")
+    preselected = list(dict.fromkeys(preparation.unit_ids)) if preparation.units_specified else []
     labels = {unit_id: available[unit_id] for unit_id in preselected}
-    await state.set_state(ReportForm.choosing_city)
     await state.update_data(
         source_query=query,
         preparation=preparation.model_dump(mode="json"),
@@ -543,7 +539,94 @@ async def _ask_units(
         date_to=preparation.date_to.isoformat() if preparation.date_to else None,
         metric_label=", ".join(preparation.report_types),
     )
-    await _show_cities(message, state, user, service)
+    await _advance_natural_flow(message, state, user, service)
+
+
+async def _advance_natural_flow(
+    message: Message | None,
+    state: FSMContext,
+    user: TelegramUser,
+    service: BotReportService,
+) -> None:
+    if message is None:
+        return
+    data = await state.get_data()
+    if not _unit_ids(data):
+        await _show_cities(message, state, user, service)
+        return
+
+    preparation = data.get("preparation") or {}
+    if not data.get("granularity"):
+        prepared_granularity = str(preparation.get("granularity") or "")
+        if preparation.get("granularity_specified") and prepared_granularity in (
+            _allowed_granularities(data, service)
+        ):
+            await state.update_data(
+                granularity=prepared_granularity,
+                granularity_label=GRANULARITY_LABELS.get(
+                    prepared_granularity, prepared_granularity
+                ),
+            )
+            data = await state.get_data()
+        else:
+            await _ask_granularity(message, state, service)
+            return
+
+    data = await state.get_data()
+    options = [str(value) for value in preparation.get("sales_channel_options") or []]
+    selected_channel = str(data.get("sales_channel_choice") or "")
+    if preparation.get("sales_channel_specified"):
+        selected_channel = selected_channel or str(preparation.get("sales_channel_selection") or "")
+    if options and not selected_channel:
+        await state.set_state(ReportForm.choosing_channel)
+        await message.answer(
+            "Выберите каналы продаж:",
+            reply_markup=sales_channel_keyboard(
+                options,
+                can_split=bool(preparation.get("sales_channel_can_split")),
+                prefix="report",
+            ),
+        )
+        return
+    if selected_channel and not data.get("sales_channel_choice"):
+        label = (
+            "Все каналы вместе"
+            if selected_channel == "all"
+            else "Разбивка по каналам"
+            if selected_channel == "split"
+            else sales_channel_label(selected_channel)
+        )
+        await state.update_data(
+            sales_channel_choice=selected_channel,
+            sales_channel_label=label,
+        )
+
+    if not data.get("output_format"):
+        prepared_format = str(preparation.get("output_format") or "")
+        if preparation.get("output_format_specified") and prepared_format:
+            output_format = _parse_format(prepared_format, user, service)
+            await state.update_data(output_format=output_format.value)
+        else:
+            await state.set_state(ReportForm.choosing_format)
+            await message.answer(
+                "Выберите формат:",
+                reply_markup=format_keyboard(
+                    "report", include_sheets=service.sheets_available(user)
+                ),
+            )
+            return
+
+    await state.set_state(ReportForm.confirming)
+    data = await state.get_data()
+    await message.answer(
+        _confirmation_text(data),
+        reply_markup=keyboard(
+            [
+                [("Сформировать", "report:natural-confirm")],
+                [("Отмена", "report:cancel")],
+            ]
+        ),
+    )
 
 
 async def _show_cities(

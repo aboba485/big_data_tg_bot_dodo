@@ -107,6 +107,7 @@ def _ready_service(**extra) -> SimpleNamespace:
                 status="ready",
                 report_types=["sales"],
                 unit_ids=["unit-1"],
+                units_specified=True,
                 date_from=None,
                 date_to=None,
             )
@@ -159,7 +160,7 @@ async def test_reports_command_shows_help_instead_of_guided_flow() -> None:
 
 
 @pytest.mark.asyncio
-async def test_natural_request_asks_for_city_then_units_after_prepare() -> None:
+async def test_natural_request_with_unit_skips_city_selection() -> None:
     state = FakeState()
     service = _ready_service()
 
@@ -167,20 +168,24 @@ async def test_natural_request_asks_for_city_then_units_after_prepare() -> None:
     await natural_language_report(query, state, _user(), service)  # type: ignore[arg-type]
 
     assert query.answers[0] == ("⏳ Разбираю запрос…", None)
-    assert state.state == ReportForm.choosing_city
-    assert "выберите город" in query.answers[-1][0].casefold()
+    assert state.state == ReportForm.choosing_granularity
+    assert "разбить данные по времени" in query.answers[-1][0].casefold()
     assert query.answers[-1][1] is not None
     assert state.data["unit_ids"] == ["unit-1"]
 
-    callback = FakeCallback(data="report:city:city-token", message=query)
-    await choose_city_callback(callback, state, _user(), service)  # type: ignore[arg-type]
 
-    assert state.state == ReportForm.choosing_unit
-    markup = query.answers[-1][1]
-    assert markup.inline_keyboard[0][0].callback_data == "report:toggle:unit-1"
-    assert any(
-        button.callback_data == "report:cities" for row in markup.inline_keyboard for button in row
+@pytest.mark.asyncio
+async def test_natural_request_without_unit_asks_for_city() -> None:
+    state = FakeState()
+    service = _ready_service(
+        prepare=AsyncMock(return_value=BotPreparation(status="ready", report_types=["sales"]))
     )
+
+    query = FakeMessage(text="Покажи выручку за июнь")
+    await natural_language_report(query, state, _user(), service)  # type: ignore[arg-type]
+
+    assert state.state == ReportForm.choosing_city
+    assert "выберите город" in query.answers[-1][0].casefold()
 
 
 @pytest.mark.asyncio
@@ -229,6 +234,7 @@ async def test_natural_request_clarification_moves_to_unit_selection() -> None:
                     status="ready",
                     report_types=["sales"],
                     unit_ids=["unit-1"],
+                    units_specified=True,
                 ),
             ]
         )
@@ -241,9 +247,9 @@ async def test_natural_request_clarification_moves_to_unit_selection() -> None:
 
     clarification = FakeMessage(text="за июнь 2026")
     await clarify_report(clarification, state, _user(), service)  # type: ignore[arg-type]
-    assert state.state == ReportForm.choosing_city
+    assert state.state == ReportForm.choosing_granularity
     assert "за июнь 2026" in str(state.data["source_query"])
-    assert "выберите город" in clarification.answers[-1][0].casefold()
+    assert "разбить данные по времени" in clarification.answers[-1][0].casefold()
 
 
 @pytest.mark.asyncio
@@ -274,6 +280,8 @@ async def test_granularity_moves_to_format() -> None:
         data={
             "started_at": 10**20,
             "preparation": {"report_types": ["sales"]},
+            "unit_ids": ["unit-1"],
+            "unit_labels": {"unit-1": "Ресторан 1"},
         },
         state=ReportForm.choosing_granularity,
     )
@@ -298,6 +306,8 @@ async def test_granularity_offers_channel_choice_for_capable_report() -> None:
                 "sales_channel_options": ["Delivery", "Dine-in", "Takeaway"],
                 "sales_channel_can_split": True,
             },
+            "unit_ids": ["unit-1"],
+            "unit_labels": {"unit-1": "Ресторан 1"},
         },
         state=ReportForm.choosing_granularity,
     )
@@ -351,6 +361,9 @@ async def test_channel_choice_moves_to_format() -> None:
                 "sales_channel_options": ["Delivery", "Dine-in", "Takeaway"],
                 "sales_channel_can_split": True,
             },
+            "unit_ids": ["unit-1"],
+            "unit_labels": {"unit-1": "Ресторан 1"},
+            "granularity": "day",
         },
         state=ReportForm.choosing_channel,
     )
@@ -363,6 +376,35 @@ async def test_channel_choice_moves_to_format() -> None:
     assert state.data["sales_channel_choice"] == "Delivery"
     assert state.data["sales_channel_label"] == "Доставка"
     assert "формат" in callback.message.answers[-1][0].casefold()
+
+
+@pytest.mark.asyncio
+async def test_complete_natural_request_skips_redundant_choices() -> None:
+    state = FakeState()
+    service = _ready_service(
+        prepare=AsyncMock(
+            return_value=BotPreparation(
+                status="ready",
+                report_types=["sales"],
+                unit_ids=["unit-1"],
+                units_specified=True,
+                granularity=Granularity.DAY,
+                output_format=OutputFormat.CSV,
+                granularity_specified=True,
+                output_format_specified=True,
+            )
+        )
+    )
+
+    message = FakeMessage(text="Выручка Ресторан 1 за июнь 2026 по дням в CSV")
+    await natural_language_report(message, state, _user(), service)  # type: ignore[arg-type]
+
+    assert state.state == ReportForm.confirming
+    assert state.data["granularity"] == "day"
+    assert state.data["output_format"] == "csv"
+    assert "Ресторан 1" in message.answers[-1][0]
+    assert "По дням" in message.answers[-1][0]
+    assert "CSV" in message.answers[-1][0]
 
 
 @pytest.mark.asyncio

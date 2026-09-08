@@ -10,6 +10,7 @@ import pytest
 from app.bot.errors import BotInputError
 from app.bot.handlers.weekly import (
     WEEKLY_REPORT_HOURS,
+    _schedule_intent,
     _time_keyboard,
     weekly_city,
     weekly_granularity,
@@ -22,7 +23,7 @@ from app.bot.models import BotPreparation, BotReportResult
 from app.bot.scheduler import WeeklyReportScheduler
 from app.bot.services import UnitCity
 from app.bot.states.reports import WeeklyReportForm
-from app.planner.schemas import Granularity
+from app.planner.schemas import Granularity, OutputFormat
 from app.storage.sqlite import SQLiteDatabase
 from app.storage.weekly_reports import (
     WeeklyReportLimitError,
@@ -221,11 +222,43 @@ def test_weekly_time_keyboard_contains_every_hour_from_6_to_22() -> None:
     assert markup.inline_keyboard[-1][0].callback_data == "weekly:cancel"
 
 
+@pytest.mark.parametrize(
+    ("query", "missing_fields"),
+    [
+        ("каждый понедельник и пятницу в 9:00", {"weekday"}),
+        ("каждую пятницу в 9:00 и в 18:00", {"local_hour"}),
+        ("каждую пятницу в 9:30", {"local_hour"}),
+        ("каждую пятницу в 9:60", {"local_hour"}),
+        ("каждый понедельник, отчёт в 7 заведениях", {"local_hour"}),
+        ("каждую пятницу в 11 вечера", {"local_hour"}),
+        ("каждую пятницу в 11 часов вечера", {"local_hour"}),
+        ("каждую пятницу в 9 часов 30 минут", {"local_hour"}),
+        ("ежемесячно каждую пятницу в 9:00", {"frequency", "weekday"}),
+    ],
+)
+def test_schedule_intent_does_not_guess_ambiguous_values(query, missing_fields) -> None:
+    intent = _schedule_intent(query)
+
+    assert missing_fields.isdisjoint(intent)
+
+
+def test_schedule_intent_understands_hours_with_daypart() -> None:
+    assert _schedule_intent("каждую пятницу в 10 часов вечера")["local_hour"] == 22
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("hour", [6, 22])
 async def test_weekly_time_accepts_range_boundaries(hour) -> None:
     callback = FakeCallback(data=f"weekly:time:{hour}")
-    state = FakeState()
+    state = FakeState(
+        data={
+            "unit_ids": ["unit-1"],
+            "granularity": "total",
+            "frequency": "weekly",
+            "weekday": 0,
+            "preparation": {},
+        }
+    )
 
     await weekly_time(callback, state, _user(), _format_service())  # type: ignore[arg-type]
 
@@ -247,7 +280,7 @@ async def test_weekly_time_rejects_values_outside_allowed_range(value) -> None:
 
 
 @pytest.mark.asyncio
-async def test_weekly_query_moves_to_unit_selection() -> None:
+async def test_weekly_query_with_unit_skips_unit_selection() -> None:
     state = FakeState(data={"started_at": 10**20}, state=WeeklyReportForm.waiting_query)
     user = SimpleNamespace(telegram_id=1)
     city = UnitCity(
@@ -262,33 +295,28 @@ async def test_weekly_query_moves_to_unit_selection() -> None:
                 status="ready",
                 report_types=["sales"],
                 unit_ids=["unit-1"],
+                units_specified=True,
             )
         ),
         available_reports=lambda _user: [("sales", "Выручка")],
         available_units=lambda _user: [("unit-1", "Ресторан 1")],
         available_unit_cities=lambda _user: [city],
         units_in_city=lambda _user, city_id: list(city.units) if city_id == city.city_id else [],
-        metrics=SimpleNamespace(has=lambda metric_id: metric_id == "sales"),
+        metrics=SimpleNamespace(
+            has=lambda metric_id: metric_id == "sales",
+            get=lambda _metric_id: SimpleNamespace(granularities=["total", "day", "week", "month"]),
+        ),
+        sheets_available=lambda _user: False,
     )
     message = FakeMessage(text="Покажи выручку")
 
     await weekly_query(message, state, user, service)  # type: ignore[arg-type]
 
     assert message.answers[0] == ("⏳ Разбираю запрос…", None)
-    assert state.state == WeeklyReportForm.choosing_city
+    assert state.state == WeeklyReportForm.choosing_granularity
     assert state.data["metric_id"] == "sales"
     assert state.data["unit_ids"] == ["unit-1"]
-    assert "выберите город" in message.answers[-1][0].casefold()
-
-    callback = FakeCallback(data="weekly:city:city-token", message=message)
-    await weekly_city(callback, state, user, service)  # type: ignore[arg-type]
-
-    assert state.state == WeeklyReportForm.choosing_unit
-    markup = message.answers[-1][1]
-    assert markup.inline_keyboard[0][0].callback_data == "weekly:toggle:unit-1"
-    assert any(
-        button.callback_data == "weekly:cities" for row in markup.inline_keyboard for button in row
-    )
+    assert "разбить данные по времени" in message.answers[-1][0].casefold()
 
 
 @pytest.mark.asyncio
@@ -341,6 +369,7 @@ async def test_weekly_granularity_moves_to_frequency() -> None:
             "started_at": 10**20,
             "metric_id": "sales",
             "preparation": {"report_types": ["sales"]},
+            "unit_ids": ["unit-1"],
         },
         state=WeeklyReportForm.choosing_granularity,
     )
@@ -352,12 +381,54 @@ async def test_weekly_granularity_moves_to_frequency() -> None:
     )
     callback = FakeCallback(data="weekly:granularity:week")
 
-    await weekly_granularity(callback, state, service)  # type: ignore[arg-type]
+    await weekly_granularity(  # type: ignore[arg-type]
+        callback, state, _user(), service
+    )
 
     assert state.state == WeeklyReportForm.choosing_frequency
     assert state.data["granularity"] == "week"
     assert state.data["granularity_label"] == "По неделям"
     assert "часто" in callback.message.answers[-1][0].lower()
+
+
+@pytest.mark.asyncio
+async def test_complete_scheduled_query_skips_redundant_choices() -> None:
+    state = FakeState(data={"started_at": 10**20}, state=WeeklyReportForm.waiting_query)
+    service = SimpleNamespace(
+        settings=SimpleNamespace(telegram_fsm_ttl_seconds=1800),
+        prepare=AsyncMock(
+            return_value=BotPreparation(
+                status="ready",
+                report_types=["sales"],
+                unit_ids=["unit-1"],
+                units_specified=True,
+                granularity=Granularity.DAY,
+                output_format=OutputFormat.CSV,
+                granularity_specified=True,
+                output_format_specified=True,
+            )
+        ),
+        available_reports=lambda _user: [("sales", "Выручка")],
+        available_units=lambda _user: [("unit-1", "Ресторан 1")],
+        metrics=SimpleNamespace(
+            has=lambda metric_id: metric_id == "sales",
+            get=lambda _metric_id: SimpleNamespace(granularities=["total", "day", "week", "month"]),
+        ),
+        sheets_available=lambda _user: False,
+    )
+    message = FakeMessage(text="Выручка Ресторан 1 по дням в CSV каждую пятницу в 9:00")
+
+    await weekly_query(message, state, _user(), service)  # type: ignore[arg-type]
+
+    service.prepare.assert_awaited_once_with(  # type: ignore[attr-defined]
+        _user(), message.text, defer_units=True, for_schedule=True
+    )
+    assert state.state == WeeklyReportForm.confirming
+    assert state.data["weekday"] == 4
+    assert state.data["local_hour"] == 9
+    assert state.data["granularity"] == "day"
+    assert state.data["output_format"] == "csv"
+    assert "Пятница, 09:00" in message.answers[-1][0]
 
 
 @pytest.mark.asyncio
@@ -371,6 +442,8 @@ async def test_weekly_flow_offers_and_saves_channel_choice() -> None:
                 "sales_channel_options": ["Delivery", "Dine-in", "Takeaway"],
                 "sales_channel_can_split": True,
             },
+            "unit_ids": ["unit-1"],
+            "unit_labels": {"unit-1": "Ресторан 1"},
         },
         state=WeeklyReportForm.choosing_granularity,
     )
@@ -383,7 +456,7 @@ async def test_weekly_flow_offers_and_saves_channel_choice() -> None:
     granularity_callback = FakeCallback(data="weekly:granularity:total")
 
     await weekly_granularity(  # type: ignore[arg-type]
-        granularity_callback, state, service
+        granularity_callback, state, _user(), service
     )
 
     assert state.state == WeeklyReportForm.choosing_channel
@@ -395,7 +468,9 @@ async def test_weekly_flow_offers_and_saves_channel_choice() -> None:
     assert "weekly:channel:split" in callbacks
 
     channel_callback = FakeCallback(data="weekly:channel:Delivery")
-    await weekly_sales_channel(channel_callback, state)  # type: ignore[arg-type]
+    await weekly_sales_channel(  # type: ignore[arg-type]
+        channel_callback, state, _user(), service
+    )
 
     assert state.data["sales_channel_choice"] == "Delivery"
     assert state.state == WeeklyReportForm.choosing_frequency

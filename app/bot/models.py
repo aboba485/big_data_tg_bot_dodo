@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from app.planner.schemas import Granularity, OutputFormat
+
 
 class BotPreparation(BaseModel):
     status: Literal["ready", "needs_clarification", "unsupported"]
@@ -18,6 +20,12 @@ class BotPreparation(BaseModel):
     sales_channel_options: list[str] = Field(default_factory=list)
     sales_channel_can_split: bool = False
     sales_channel_selection: str = ""
+    sales_channel_specified: bool = False
+    granularity: Granularity | None = None
+    output_format: OutputFormat | None = None
+    units_specified: bool = False
+    granularity_specified: bool = False
+    output_format_specified: bool = False
 
 
 class BotReportResult(BaseModel):

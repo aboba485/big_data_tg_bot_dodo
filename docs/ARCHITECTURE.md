@@ -37,6 +37,13 @@ model call; report and unit permissions are rechecked before execution. `app/mai
 the migration. `app/report_service.py` coordinates the report use case without transport logic
 or metric formulas.
 
+Natural-language Telegram flows use progressive completion: unit, granularity, output format,
+and schedule fields that were explicitly and unambiguously supplied by the user are carried into
+FSM state. Buttons are shown only for missing or unsupported values, followed by a complete
+confirmation screen. Planner defaults are not treated as explicit user choices, and unit/report
+permissions plus Google Sheets availability are checked again before execution or subscription
+creation.
+
 ## Components
 
 | Path | Responsibility |

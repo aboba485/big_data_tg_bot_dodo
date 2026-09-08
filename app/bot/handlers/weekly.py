@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -26,6 +27,7 @@ from app.bot.services import BotReportService
 from app.bot.states.reports import ScheduledReportForm
 from app.dodo.channels import sales_channel_label
 from app.planner.schemas import Granularity
+from app.retrieval.normalizer import normalize_query
 from app.storage.weekly_reports import (
     ScheduledReportLimitError,
     WeeklyReportRepository,
@@ -55,6 +57,15 @@ SCHEDULED_REPORT_HOURS = tuple(range(6, 23))
 # Alias for backward compatibility
 WEEKLY_REPORT_HOURS = SCHEDULED_REPORT_HOURS
 DEFAULT_GRANULARITIES = ["total", "day", "week", "month"]
+WEEKDAY_PATTERNS = (
+    (0, r"понедель\w*"),
+    (1, r"вторник\w*"),
+    (2, r"сред(?:а|у|ы|е)"),
+    (3, r"четверг\w*"),
+    (4, r"пятниц\w*"),
+    (5, r"суббот\w*"),
+    (6, r"воскресень\w*"),
+)
 
 
 @router.message(Command("schedules"))
@@ -115,7 +126,9 @@ async def weekly_query(
     await _ensure_active(state, bot_report_service)
     query = message.text or ""
     await message.answer("⏳ Разбираю запрос…")
-    preparation = await bot_report_service.prepare(telegram_user, query, defer_units=True)
+    preparation = await bot_report_service.prepare(
+        telegram_user, query, defer_units=True, for_schedule=True
+    )
     if preparation.status == "needs_clarification":
         await message.answer(preparation.question or "Уточните параметры отчёта.")
         return
@@ -128,20 +141,20 @@ async def weekly_query(
         return
 
     available = dict(bot_report_service.available_reports(telegram_user))
-    metric_id = next(
-        (item for item in preparation.report_types if item in available),
-        None,
-    )
+    matched_metric_ids = [item for item in preparation.report_types if item in available]
+    metric_id = matched_metric_ids[0] if len(matched_metric_ids) == 1 else None
     if metric_id is None:
+        if len(matched_metric_ids) > 1:
+            raise BotInputError("Для расписания укажите один тип отчёта.")
         raise BotInputError(
             "Не удалось определить тип отчёта. Опишите метрику, например: «Покажи выручку»."
         )
 
-    units = bot_report_service.available_units(telegram_user)
-    available_units = dict(units)
-    preselected = [unit_id for unit_id in preparation.unit_ids if unit_id in available_units]
+    available_units = dict(bot_report_service.available_units(telegram_user))
+    if any(unit_id not in available_units for unit_id in preparation.unit_ids):
+        raise BotInputError("Одно из указанных заведений недоступно.")
+    preselected = list(dict.fromkeys(preparation.unit_ids)) if preparation.units_specified else []
     labels = {unit_id: available_units[unit_id] for unit_id in preselected}
-    await state.set_state(WeeklyReportForm.choosing_city)
     await state.update_data(
         source_query=query,
         preparation=preparation.model_dump(mode="json"),
@@ -149,10 +162,12 @@ async def weekly_query(
         metric_label=available[metric_id],
         unit_ids=preselected,
         unit_labels=labels,
+        unit_label=", ".join(labels.get(unit_id, unit_id) for unit_id in preselected),
         units_page=0,
         started_at=time.time(),
+        **_schedule_intent(query),
     )
-    await _show_cities(message, state, telegram_user, bot_report_service)
+    await _advance_schedule_flow(message, state, telegram_user, bot_report_service)
 
 
 @router.callback_query(WeeklyReportForm.choosing_city, F.data.startswith("weekly:city:"))
@@ -291,14 +306,7 @@ async def weekly_units_action(
             unit_labels=labels,
             unit_label=", ".join(labels.get(unit_id, unit_id) for unit_id in selected),
         )
-        await state.set_state(WeeklyReportForm.choosing_granularity)
-        if callback.message:
-            await callback.message.answer(
-                "Как разбить данные по времени?",
-                reply_markup=granularity_keyboard(
-                    "weekly", _allowed_granularities(data, bot_report_service)
-                ),
-            )
+        await _advance_schedule_flow(callback.message, state, telegram_user, bot_report_service)
         return
 
     await callback.answer()
@@ -315,7 +323,10 @@ async def weekly_units_action(
     ScheduledReportForm.choosing_granularity, F.data.startswith("weekly:granularity:")
 )
 async def weekly_granularity(
-    callback: CallbackQuery, state: FSMContext, bot_report_service: BotReportService
+    callback: CallbackQuery,
+    state: FSMContext,
+    telegram_user: TelegramUser,
+    bot_report_service: BotReportService,
 ) -> None:
     await callback.answer()
     value = (callback.data or "").removeprefix("weekly:granularity:")
@@ -331,11 +342,16 @@ async def weekly_granularity(
         granularity=granularity.value,
         granularity_label=GRANULARITY_LABELS.get(granularity.value, granularity.value),
     )
-    await _ask_channel_or_frequency(callback.message, state)
+    await _advance_schedule_flow(callback.message, state, telegram_user, bot_report_service)
 
 
 @router.callback_query(ScheduledReportForm.choosing_channel, F.data.startswith("weekly:channel:"))
-async def weekly_sales_channel(callback: CallbackQuery, state: FSMContext) -> None:
+async def weekly_sales_channel(
+    callback: CallbackQuery,
+    state: FSMContext,
+    telegram_user: TelegramUser,
+    bot_report_service: BotReportService,
+) -> None:
     await callback.answer()
     choice = (callback.data or "").removeprefix("weekly:channel:")
     data = await state.get_data()
@@ -352,11 +368,16 @@ async def weekly_sales_channel(callback: CallbackQuery, state: FSMContext) -> No
         else sales_channel_label(choice)
     )
     await state.update_data(sales_channel_choice=choice, sales_channel_label=label)
-    await _ask_frequency(callback.message, state)
+    await _advance_schedule_flow(callback.message, state, telegram_user, bot_report_service)
 
 
 @router.callback_query(ScheduledReportForm.choosing_frequency, F.data.startswith("weekly:freq:"))
-async def schedule_frequency(callback: CallbackQuery, state: FSMContext) -> None:
+async def schedule_frequency(
+    callback: CallbackQuery,
+    state: FSMContext,
+    telegram_user: TelegramUser,
+    bot_report_service: BotReportService,
+) -> None:
     await callback.answer()
     frequency = (callback.data or "").removeprefix("weekly:freq:")
     if frequency not in ("weekly", "monthly"):
@@ -364,54 +385,40 @@ async def schedule_frequency(callback: CallbackQuery, state: FSMContext) -> None
     await state.update_data(
         frequency=frequency,
         frequency_label=FREQUENCY_LABELS.get(frequency, frequency),
+        weekday=None,
+        day_of_month=None,
     )
-    if frequency == "monthly":
-        await state.set_state(ScheduledReportForm.choosing_day_of_month)
-        if callback.message:
-            await callback.message.answer(
-                "В какой день месяца присылать отчёт?",
-                reply_markup=_day_of_month_keyboard(),
-            )
-    else:
-        await state.set_state(ScheduledReportForm.choosing_weekday)
-        if callback.message:
-            await callback.message.answer(
-                "В какой день недели присылать отчёт?",
-                reply_markup=keyboard(
-                    [[(label, f"weekly:day:{day}")] for day, label in enumerate(WEEKDAYS)]
-                    + [[("Отмена", "weekly:cancel")]]
-                ),
-            )
+    await _advance_schedule_flow(callback.message, state, telegram_user, bot_report_service)
 
 
 @router.callback_query(ScheduledReportForm.choosing_day_of_month, F.data.startswith("weekly:dom:"))
-async def schedule_day_of_month(callback: CallbackQuery, state: FSMContext) -> None:
+async def schedule_day_of_month(
+    callback: CallbackQuery,
+    state: FSMContext,
+    telegram_user: TelegramUser,
+    bot_report_service: BotReportService,
+) -> None:
     await callback.answer()
     day = _callback_int(callback.data, "weekly:dom:", "дня месяца")
     if day not in range(1, 29):
         raise BotInputError("День месяца должен быть от 1 до 28.")
     await state.update_data(day_of_month=day, weekday=0)
-    await state.set_state(ScheduledReportForm.choosing_time)
-    if callback.message:
-        await callback.message.answer(
-            "Во сколько присылать отчёт?",
-            reply_markup=_time_keyboard(),
-        )
+    await _advance_schedule_flow(callback.message, state, telegram_user, bot_report_service)
 
 
 @router.callback_query(ScheduledReportForm.choosing_weekday, F.data.startswith("weekly:day:"))
-async def weekly_day(callback: CallbackQuery, state: FSMContext) -> None:
+async def weekly_day(
+    callback: CallbackQuery,
+    state: FSMContext,
+    telegram_user: TelegramUser,
+    bot_report_service: BotReportService,
+) -> None:
     await callback.answer()
     weekday = _callback_int(callback.data, "weekly:day:", "дня недели")
     if weekday not in range(7):
         raise BotInputError("Неизвестный день недели.")
     await state.update_data(weekday=weekday, day_of_month=None)
-    await state.set_state(ScheduledReportForm.choosing_time)
-    if callback.message:
-        await callback.message.answer(
-            "Во сколько присылать отчёт?",
-            reply_markup=_time_keyboard(),
-        )
+    await _advance_schedule_flow(callback.message, state, telegram_user, bot_report_service)
 
 
 @router.callback_query(ScheduledReportForm.choosing_time, F.data.startswith("weekly:time:"))
@@ -426,14 +433,7 @@ async def weekly_time(
     if hour not in SCHEDULED_REPORT_HOURS:
         raise BotInputError("Недоступное время отправки.")
     await state.update_data(local_hour=hour)
-    await state.set_state(ScheduledReportForm.choosing_format)
-    if callback.message:
-        await callback.message.answer(
-            "Выберите формат:",
-            reply_markup=format_keyboard(
-                "weekly", include_sheets=bot_report_service.sheets_available(telegram_user)
-            ),
-        )
+    await _advance_schedule_flow(callback.message, state, telegram_user, bot_report_service)
 
 
 @router.callback_query(ScheduledReportForm.choosing_format, F.data.startswith("weekly:format:"))
@@ -542,6 +542,197 @@ async def weekly_cancel(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     if callback.message:
         await callback.message.answer("Действие отменено.", reply_markup=main_menu())
+
+
+async def _advance_schedule_flow(
+    message: Message | None,
+    state: FSMContext,
+    user: TelegramUser,
+    service: BotReportService,
+) -> None:
+    if message is None:
+        return
+    data = await state.get_data()
+    if not _unit_ids(data):
+        await _show_cities(message, state, user, service)
+        return
+
+    preparation = data.get("preparation") or {}
+    if not data.get("granularity"):
+        prepared_granularity = str(preparation.get("granularity") or "")
+        if preparation.get("granularity_specified") and prepared_granularity in (
+            _allowed_granularities(data, service)
+        ):
+            await state.update_data(
+                granularity=prepared_granularity,
+                granularity_label=GRANULARITY_LABELS.get(
+                    prepared_granularity, prepared_granularity
+                ),
+            )
+            data = await state.get_data()
+        else:
+            await state.set_state(WeeklyReportForm.choosing_granularity)
+            await message.answer(
+                "Как разбить данные по времени?",
+                reply_markup=granularity_keyboard("weekly", _allowed_granularities(data, service)),
+            )
+            return
+
+    data = await state.get_data()
+    options = [str(value) for value in preparation.get("sales_channel_options") or []]
+    selected_channel = str(data.get("sales_channel_choice") or "")
+    if preparation.get("sales_channel_specified"):
+        selected_channel = selected_channel or str(preparation.get("sales_channel_selection") or "")
+    if options and not selected_channel:
+        await state.set_state(ScheduledReportForm.choosing_channel)
+        await message.answer(
+            "Выберите каналы продаж:",
+            reply_markup=sales_channel_keyboard(
+                options,
+                can_split=bool(preparation.get("sales_channel_can_split")),
+                prefix="weekly",
+            ),
+        )
+        return
+    if selected_channel and not data.get("sales_channel_choice"):
+        label = (
+            "Все каналы вместе"
+            if selected_channel == "all"
+            else "Разбивка по каналам"
+            if selected_channel == "split"
+            else sales_channel_label(selected_channel)
+        )
+        await state.update_data(
+            sales_channel_choice=selected_channel,
+            sales_channel_label=label,
+        )
+
+    frequency = data.get("frequency")
+    if frequency not in {"weekly", "monthly"}:
+        await state.set_state(ScheduledReportForm.choosing_frequency)
+        await message.answer(
+            "Как часто присылать отчёт?",
+            reply_markup=keyboard(
+                [
+                    [("📅 Раз в неделю", "weekly:freq:weekly")],
+                    [("📆 Раз в месяц", "weekly:freq:monthly")],
+                    [("Отмена", "weekly:cancel")],
+                ]
+            ),
+        )
+        return
+
+    if frequency == "monthly" and data.get("day_of_month") is None:
+        await state.set_state(ScheduledReportForm.choosing_day_of_month)
+        await message.answer(
+            "В какой день месяца присылать отчёт?",
+            reply_markup=_day_of_month_keyboard(),
+        )
+        return
+    if frequency == "weekly" and data.get("weekday") is None:
+        await state.set_state(ScheduledReportForm.choosing_weekday)
+        await message.answer(
+            "В какой день недели присылать отчёт?",
+            reply_markup=keyboard(
+                [[(label, f"weekly:day:{day}")] for day, label in enumerate(WEEKDAYS)]
+                + [[("Отмена", "weekly:cancel")]]
+            ),
+        )
+        return
+
+    if data.get("local_hour") is None:
+        await state.set_state(ScheduledReportForm.choosing_time)
+        await message.answer("Во сколько присылать отчёт?", reply_markup=_time_keyboard())
+        return
+
+    if not data.get("output_format"):
+        prepared_format = str(preparation.get("output_format") or "")
+        allowed = allowed_formats(include_sheets=service.sheets_available(user))
+        if preparation.get("output_format_specified") and prepared_format in allowed:
+            await state.update_data(output_format=prepared_format)
+        elif preparation.get("output_format_specified") and prepared_format == "sheets":
+            raise BotInputError(DRIVE_NOT_LINKED)
+        else:
+            await state.set_state(ScheduledReportForm.choosing_format)
+            await message.answer(
+                "Выберите формат:",
+                reply_markup=format_keyboard(
+                    "weekly", include_sheets=service.sheets_available(user)
+                ),
+            )
+            return
+
+    await state.set_state(ScheduledReportForm.confirming)
+    data = await state.get_data()
+    await message.answer(
+        _confirmation(data),
+        reply_markup=keyboard([[("Сохранить", "weekly:confirm")], [("Отмена", "weekly:cancel")]]),
+    )
+
+
+def _schedule_intent(query: str) -> dict[str, object]:
+    raw_query = query.casefold().replace("ё", "е")
+    normalized = normalize_query(query)
+    values: dict[str, object] = {}
+
+    weekdays = {
+        index for index, pattern in WEEKDAY_PATTERNS if re.search(rf"\b{pattern}\b", normalized)
+    }
+    days_of_month = {
+        int(match)
+        for match in re.findall(
+            r"\b(?:кажд\w*\s+)?([1-9]|1\d|2[0-8])(?:-?го)?\s+числ\w*\b",
+            normalized,
+        )
+    }
+    frequencies: set[str] = set()
+    if weekdays or re.search(r"\b(?:еженедельн\w*|раз\s+в\s+недел\w*)\b", normalized):
+        frequencies.add("weekly")
+    if days_of_month or re.search(r"\b(?:ежемесячн\w*|раз\s+в\s+месяц)\b", normalized):
+        frequencies.add("monthly")
+
+    frequency = next(iter(frequencies)) if len(frequencies) == 1 else None
+    if frequency == "monthly":
+        values.update(
+            frequency="monthly",
+            frequency_label=FREQUENCY_LABELS["monthly"],
+            weekday=0,
+        )
+        if len(days_of_month) == 1:
+            values["day_of_month"] = next(iter(days_of_month))
+    elif frequency == "weekly":
+        values.update(
+            frequency="weekly",
+            frequency_label=FREQUENCY_LABELS["weekly"],
+            day_of_month=None,
+        )
+        if len(weekdays) == 1:
+            values["weekday"] = next(iter(weekdays))
+
+    hours: set[int] = set()
+    for time_match in re.finditer(
+        r"\bв\s+(\d{1,2})(?::(\d{2}))?(?![:\d])\s*"
+        r"(?:(утра|дня|вечера)|(час(?:а|ов)?)(?:\s+(\d{1,2})\s+минут\w*)?"
+        r"(?:\s+(утра|дня|вечера))?)?\b",
+        raw_query,
+    ):
+        suffix = time_match.group(3) or time_match.group(6) or ""
+        has_hours_word = time_match.group(4) is not None
+        if time_match.group(2) is None and not suffix and not has_hours_word:
+            continue
+        if time_match.group(2) not in {None, "00"} or time_match.group(5) not in {
+            None,
+            "00",
+        }:
+            continue
+        hour = int(time_match.group(1))
+        if (suffix == "вечера" and 1 <= hour <= 11) or (suffix == "дня" and 1 <= hour <= 5):
+            hour += 12
+        if hour in SCHEDULED_REPORT_HOURS:
+            hours.add(hour)
+    if len(hours) == 1:
+        values["local_hour"] = next(iter(hours))
+    return values
 
 
 async def _show_list(

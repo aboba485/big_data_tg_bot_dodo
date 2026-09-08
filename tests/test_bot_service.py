@@ -12,7 +12,14 @@ from app.bot.models import BotPreparation
 from app.bot.services import BotReportService, PreparationContext
 from app.documentation.models import EndpointCandidate
 from app.errors import PlannerError
-from app.planner.schemas import Granularity, OutputFormat, PlannerResult, PlanStatus, ReportPlan
+from app.planner.schemas import (
+    Granularity,
+    OutputFormat,
+    PlannerResult,
+    PlanStatus,
+    ReportFilter,
+    ReportPlan,
+)
 from app.services import build_services
 from app.users.models import TelegramRole, TelegramUser
 from tests.conftest import UNIT_ID
@@ -113,6 +120,20 @@ async def test_prepare_asks_for_period_when_only_date_from_is_set(settings) -> N
 
 
 @pytest.mark.asyncio
+async def test_schedule_prepare_uses_internal_validation_period(settings) -> None:
+    service = _bot_service(settings)
+    query = f"Покажи выручку по юниту {UNIT_ID}"
+
+    preparation = await service.prepare(_admin(), query, defer_units=True, for_schedule=True)
+
+    assert preparation.status == "ready"
+    assert preparation.date_from is not None
+    assert preparation.date_to is not None
+    assert preparation.units_specified is True
+    assert service._prepared_contexts == {}
+
+
+@pytest.mark.asyncio
 async def test_run_applies_unit_and_granularity_overrides(settings) -> None:
     service = _bot_service(
         settings.model_copy(update={"default_unit_ids": [], "telegram_public_unit_ids": []})
@@ -140,6 +161,100 @@ async def test_run_applies_unit_and_granularity_overrides(settings) -> None:
     assert "day" in (result.response.get("columns") or [])
     assert result.response.get("totals", {}).get("sales", 0) > 0
     service.planner.create_plan.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_prepare_exposes_only_explicit_format_and_granularity(settings) -> None:
+    service = _bot_service(settings)
+
+    explicit = await service.prepare(
+        _admin(),
+        f"Выручка за июнь 2026 по юниту {UNIT_ID}, по дням в CSV",
+        defer_units=True,
+    )
+    defaults = await service.prepare(
+        _admin(),
+        f"Выручка за июнь 2026 по юниту {UNIT_ID}",
+        defer_units=True,
+    )
+
+    assert explicit.granularity == Granularity.DAY
+    assert explicit.output_format == OutputFormat.CSV
+    assert explicit.units_specified is True
+    assert explicit.granularity_specified is True
+    assert explicit.output_format_specified is True
+    assert defaults.granularity_specified is False
+    assert defaults.output_format_specified is False
+
+
+@pytest.mark.asyncio
+async def test_default_units_are_not_marked_as_user_selection(settings) -> None:
+    service = _bot_service(settings)
+
+    preparation = await service.prepare(
+        _admin(),
+        "Выручка за июнь 2026",
+        defer_units=True,
+    )
+
+    assert preparation.unit_ids == [UNIT_ID]
+    assert preparation.units_specified is False
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_format_and_granularity_are_not_marked_explicit(settings) -> None:
+    service = _bot_service(settings)
+
+    preparation = await service.prepare(
+        _admin(),
+        f"Выручка за июнь 2026 по юниту {UNIT_ID}, по дням и по неделям, CSV и XLSX",
+        defer_units=True,
+    )
+
+    assert preparation.granularity_specified is False
+    assert preparation.output_format_specified is False
+
+
+@pytest.mark.asyncio
+async def test_schedule_prepare_applies_explicit_sales_channel_after_period_deferral(
+    settings,
+) -> None:
+    service = _bot_service(settings)
+
+    preparation = await service.prepare(
+        _admin(),
+        f"Выручка доставки по юниту {UNIT_ID} каждую пятницу в 9:00",
+        defer_units=True,
+        for_schedule=True,
+    )
+
+    assert preparation.status == "ready"
+    assert preparation.sales_channel_specified is True
+    assert preparation.sales_channel_selection == "Delivery"
+
+
+@pytest.mark.asyncio
+async def test_planner_channel_default_is_not_marked_as_user_selection(settings) -> None:
+    service = _bot_service(settings)
+    plan = ReportPlan(
+        status=PlanStatus.READY,
+        metric_ids=["sales"],
+        operation_ids=["get-finances-sales-daily-units"],
+        date_from=date(2026, 6, 1),
+        date_to=date(2026, 6, 30),
+        unit_references=[UNIT_ID],
+        filters=[ReportFilter(name="salesChannel", values=["Delivery"])],
+    )
+    service.planner.create_plan = AsyncMock(return_value=PlannerResult(plan=plan))
+
+    preparation = await service.prepare(
+        _admin(),
+        f"Покажи выручку за июнь 2026 по юниту {UNIT_ID}",
+        defer_units=True,
+    )
+
+    assert preparation.sales_channel_specified is False
+    assert preparation.sales_channel_selection == ""
 
 
 @pytest.mark.asyncio
