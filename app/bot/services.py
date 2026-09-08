@@ -966,7 +966,6 @@ class BotReportService:
             "sales_channel_can_split": capability.can_group,
             "sales_channel_selection": selected,
         }
-
     def _resolve_file(self, report_id: str) -> tuple[Path, str]:
         if not re.fullmatch(r"[0-9a-f]{32}", report_id):
             raise BotInputError("Некорректный идентификатор файла отчёта.")
