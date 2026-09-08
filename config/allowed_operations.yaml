@@ -9,5 +9,6 @@ operations:
   - get-production-stop-sales-statistics-ingredients
   - get-production-unit-workload-by-orders
   - get-production-unit-workload-by-products
+  - get-production-orders-handover-time-statistics
+  - get-staff-meals
   - get-all-units
-

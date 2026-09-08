@@ -146,6 +146,11 @@ class SQLiteDatabase:
                     """ALTER TABLE weekly_report_subscriptions
                     ADD COLUMN day_of_month INTEGER"""
                 )
+            if "sales_channel_choice" not in columns:
+                connection.execute(
+                    """ALTER TABLE weekly_report_subscriptions
+                    ADD COLUMN sales_channel_choice TEXT NOT NULL DEFAULT ''"""
+                )
 
     def ping(self) -> bool:
         try:

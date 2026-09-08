@@ -15,6 +15,9 @@ class BotPreparation(BaseModel):
     unit_ids: list[str] = Field(default_factory=list)
     date_from: date | None = None
     date_to: date | None = None
+    sales_channel_options: list[str] = Field(default_factory=list)
+    sales_channel_can_split: bool = False
+    sales_channel_selection: str = ""
 
 
 class BotReportResult(BaseModel):

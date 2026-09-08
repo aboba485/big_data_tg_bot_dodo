@@ -14,6 +14,7 @@ from app.bot.handlers.weekly import (
     weekly_city,
     weekly_granularity,
     weekly_query,
+    weekly_sales_channel,
     weekly_time,
     weekly_units_action,
 )
@@ -183,6 +184,32 @@ def test_subscription_granularity_affects_uniqueness(tmp_path) -> None:
     assert {item.granularity for item in repository.list_for_user(10)} == {"total", "day"}
 
 
+def test_subscription_sales_channel_affects_uniqueness(tmp_path) -> None:
+    database = SQLiteDatabase(tmp_path / "weekly-channel.db")
+    database.initialize()
+    repository = WeeklyReportRepository(database)
+    common = {
+        "telegram_id": 10,
+        "chat_id": 10,
+        "metric_id": "sales",
+        "unit_id": "unit-1",
+        "output_format": "table",
+        "granularity": "total",
+        "weekday": 0,
+        "local_hour": 9,
+        "timezone_name": "Europe/Moscow",
+        "max_per_user": 5,
+    }
+
+    combined = repository.create(**common)
+    delivery = repository.create(**common, sales_channel_choice="Delivery")
+
+    assert combined.id != delivery.id
+    stored = repository.get(delivery.id)
+    assert stored is not None
+    assert stored.sales_channel_choice == "Delivery"
+
+
 def test_weekly_time_keyboard_contains_every_hour_from_6_to_22() -> None:
     markup = _time_keyboard()
     time_rows = markup.inline_keyboard[:-1]
@@ -247,6 +274,7 @@ async def test_weekly_query_moves_to_unit_selection() -> None:
 
     await weekly_query(message, state, user, service)  # type: ignore[arg-type]
 
+    assert message.answers[0] == ("⏳ Разбираю запрос…", None)
     assert state.state == WeeklyReportForm.choosing_city
     assert state.data["metric_id"] == "sales"
     assert state.data["unit_ids"] == ["unit-1"]
@@ -333,6 +361,47 @@ async def test_weekly_granularity_moves_to_frequency() -> None:
 
 
 @pytest.mark.asyncio
+async def test_weekly_flow_offers_and_saves_channel_choice() -> None:
+    state = FakeState(
+        data={
+            "started_at": 10**20,
+            "metric_id": "sales",
+            "preparation": {
+                "report_types": ["sales"],
+                "sales_channel_options": ["Delivery", "Dine-in", "Takeaway"],
+                "sales_channel_can_split": True,
+            },
+        },
+        state=WeeklyReportForm.choosing_granularity,
+    )
+    service = SimpleNamespace(
+        metrics=SimpleNamespace(
+            has=lambda metric_id: metric_id == "sales",
+            get=lambda _metric_id: SimpleNamespace(granularities=["total", "day", "week", "month"]),
+        )
+    )
+    granularity_callback = FakeCallback(data="weekly:granularity:total")
+
+    await weekly_granularity(  # type: ignore[arg-type]
+        granularity_callback, state, service
+    )
+
+    assert state.state == WeeklyReportForm.choosing_channel
+    callbacks = [
+        button.callback_data
+        for row in granularity_callback.message.answers[-1][1].inline_keyboard
+        for button in row
+    ]
+    assert "weekly:channel:split" in callbacks
+
+    channel_callback = FakeCallback(data="weekly:channel:Delivery")
+    await weekly_sales_channel(channel_callback, state)  # type: ignore[arg-type]
+
+    assert state.data["sales_channel_choice"] == "Delivery"
+    assert state.state == WeeklyReportForm.choosing_frequency
+
+
+@pytest.mark.asyncio
 async def test_scheduler_sends_previous_completed_week() -> None:
     now = datetime(2026, 8, 5, 9, 0, tzinfo=UTC)
     subscription = WeeklyReportSubscription(
@@ -347,6 +416,7 @@ async def test_scheduler_sends_previous_completed_week() -> None:
         timezone="Europe/Moscow",
         next_run_at=now,
         granularity="day",
+        sales_channel_choice="Delivery",
     )
     repository = SimpleNamespace(
         claim=Mock(return_value=True),
@@ -369,6 +439,7 @@ async def test_scheduler_sends_previous_completed_week() -> None:
     assert call["date_to"].isoformat() == "2026-08-02"
     assert call["unit_ids"] == ["000d3a240c719a8711e68aba13f7f862"]
     assert call["granularity"] == Granularity.DAY
+    assert call["sales_channel_choice"] == "Delivery"
     bot.send_message.assert_awaited_once_with(10, "Готово")
     repository.mark_sent.assert_called_once_with(subscription, "2026-08-02", now)
     repository.mark_failed.assert_not_called()

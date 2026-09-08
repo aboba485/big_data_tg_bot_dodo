@@ -4,6 +4,7 @@ import calendar
 import re
 from datetime import date, timedelta
 
+from app.dodo.channels import SALES_CHANNEL_GROUP, sales_channel_intent
 from app.planner.schemas import (
     Granularity,
     OutputFormat,
@@ -74,6 +75,18 @@ def build_mock_plan(
 ) -> PlannerResult:
     normalized = normalize_query(query)
     metrics = registry.match_aliases(normalized)
+    channel_intent = sales_channel_intent(query)
+    if channel_intent.explicit and not any(
+        marker in normalized for marker in ("стоп", "нагруз", "выдач")
+    ):
+        if "средн" in normalized and "чек" in normalized:
+            metrics = ["average_check"]
+        elif "заказ" in normalized and not any(
+            marker in normalized for marker in ("продаж", "выруч", "оборот")
+        ):
+            metrics = ["orders_count"]
+        elif any(marker in normalized for marker in ("продаж", "выруч", "оборот")):
+            metrics = ["sales_by_channel" if channel_intent.split else "sales"]
     if not metrics:
         return PlannerResult(
             plan=ReportPlan(
@@ -116,12 +129,15 @@ def build_mock_plan(
         if "csv" in normalized
         else OutputFormat.TABLE
     )
-    filters = []
-    for channel in ("Delivery", "Dine-in", "Takeaway"):
-        if channel.casefold() in normalized:
-            filters.append(ReportFilter(name="salesChannel", values=[channel]))
+    filters = (
+        [ReportFilter(name="salesChannel", values=list(channel_intent.values))]
+        if channel_intent.values
+        else []
+    )
     operations = list(dict.fromkeys(registry.get(item).operation_id for item in metrics))
     group_by = ([] if granularity == Granularity.TOTAL else [granularity.value]) + ["unit"]
+    if channel_intent.split:
+        group_by.append(SALES_CHANNEL_GROUP)
     return PlannerResult(
         plan=ReportPlan(
             status=PlanStatus.READY,

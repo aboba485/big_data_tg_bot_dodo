@@ -17,6 +17,7 @@ from app.bot.keyboards import (
     granularity_keyboard,
     keyboard,
     main_menu,
+    sales_channel_keyboard,
     unit_cities_keyboard,
     units_multiselect_keyboard,
 )
@@ -24,6 +25,7 @@ from app.bot.messages.texts import DRIVE_NOT_LINKED, HELP_TEXT
 from app.bot.models import BotPreparation
 from app.bot.services import BotReportService
 from app.bot.states.reports import ReportForm, ScheduledReportForm
+from app.dodo.channels import sales_channel_label
 from app.planner.schemas import Granularity, OutputFormat
 from app.users.models import TelegramUser
 
@@ -221,14 +223,39 @@ async def choose_granularity_callback(
         granularity=granularity.value,
         granularity_label=GRANULARITY_LABELS.get(granularity.value, granularity.value),
     )
-    await state.set_state(ReportForm.choosing_format)
-    if callback.message:
-        await callback.message.answer(
-            "Выберите формат:",
-            reply_markup=format_keyboard(
-                "report", include_sheets=bot_report_service.sheets_available(telegram_user)
-            ),
-        )
+    await _ask_channel_or_format(
+        callback.message,
+        state,
+        telegram_user,
+        bot_report_service,
+    )
+
+
+@router.callback_query(ReportForm.choosing_channel, F.data.startswith("report:channel:"))
+async def choose_sales_channel_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+    telegram_user: TelegramUser,
+    bot_report_service: BotReportService,
+) -> None:
+    await callback.answer()
+    await _ensure_active(state, bot_report_service)
+    choice = (callback.data or "").removeprefix("report:channel:")
+    data = await state.get_data()
+    preparation = data.get("preparation") or {}
+    options = [str(value) for value in preparation.get("sales_channel_options") or []]
+    can_split = bool(preparation.get("sales_channel_can_split"))
+    if choice not in {"all", *options} and not (choice == "split" and can_split):
+        raise BotInputError("Этот канал продаж недоступен.")
+    label = (
+        "Все каналы вместе"
+        if choice == "all"
+        else "Разбивка по каналам"
+        if choice == "split"
+        else sales_channel_label(choice)
+    )
+    await state.update_data(sales_channel_choice=choice, sales_channel_label=label)
+    await _ask_format(callback.message, state, telegram_user, bot_report_service)
 
 
 @router.callback_query(ReportForm.choosing_format, F.data.startswith("report:format:"))
@@ -276,6 +303,7 @@ async def confirm_natural_callback(
         OutputFormat(str(data["output_format"])),
         unit_ids=_unit_ids(data),
         granularity=Granularity(str(data.get("granularity") or Granularity.TOTAL.value)),
+        sales_channel_choice=str(data.get("sales_channel_choice") or "") or None,
     )
     if result.status == "needs_clarification":
         await state.set_state(ReportForm.clarification)
@@ -343,6 +371,11 @@ async def make_repeating_callback(
         granularity=granularity,
         granularity_label=GRANULARITY_LABELS.get(granularity, granularity),
         output_format=output_format,
+        sales_channel_choice=str(
+            data.get("sales_channel_choice")
+            or (data.get("preparation") or {}).get("sales_channel_selection")
+            or ""
+        ),
         started_at=_now_timestamp(),
         from_one_time_report=True,
     )
@@ -441,6 +474,7 @@ async def confirm_report(
         output_format,
         unit_ids=_unit_ids(data),
         granularity=Granularity(str(data.get("granularity") or Granularity.TOTAL.value)),
+        sales_channel_choice=str(data.get("sales_channel_choice") or "") or None,
     )
     if result.status == "needs_clarification":
         await state.update_data(source_query=query)
@@ -466,6 +500,7 @@ async def natural_language_report(
     bot_report_service: BotReportService,
 ) -> None:
     query = message.text or ""
+    await message.answer("⏳ Разбираю запрос…")
     preparation = await bot_report_service.prepare(telegram_user, query, defer_units=True)
     if preparation.status == "needs_clarification":
         await state.set_state(ReportForm.clarification)
@@ -544,6 +579,46 @@ async def _ask_granularity(
     )
 
 
+async def _ask_channel_or_format(
+    message: Message | None,
+    state: FSMContext,
+    user: TelegramUser,
+    service: BotReportService,
+) -> None:
+    if message is None:
+        return
+    data = await state.get_data()
+    preparation = data.get("preparation") or {}
+    options = [str(value) for value in preparation.get("sales_channel_options") or []]
+    selection = str(preparation.get("sales_channel_selection") or "")
+    if options and not selection:
+        await state.set_state(ReportForm.choosing_channel)
+        await message.answer(
+            "Как учитывать каналы продаж?",
+            reply_markup=sales_channel_keyboard(
+                options,
+                can_split=bool(preparation.get("sales_channel_can_split")),
+            ),
+        )
+        return
+    await _ask_format(message, state, user, service)
+
+
+async def _ask_format(
+    message: Message | None,
+    state: FSMContext,
+    user: TelegramUser,
+    service: BotReportService,
+) -> None:
+    if message is None:
+        return
+    await state.set_state(ReportForm.choosing_format)
+    await message.answer(
+        "Выберите формат:",
+        reply_markup=format_keyboard("report", include_sheets=service.sheets_available(user)),
+    )
+
+
 def _allowed_granularities(data: dict[str, Any], service: BotReportService) -> list[str]:
     preparation = data.get("preparation") or {}
     report_types = list(preparation.get("report_types") or [])
@@ -611,6 +686,18 @@ def _confirmation_text(data: dict[str, Any]) -> str:
     ]
     if granularity_label:
         lines.append(f"Детализация: {granularity_label}")
+    channel_choice = str(
+        data.get("sales_channel_choice") or preparation.get("sales_channel_selection") or ""
+    )
+    if channel_choice:
+        channel_label = data.get("sales_channel_label") or (
+            "Разбивка по каналам"
+            if channel_choice == "split"
+            else "Все каналы вместе"
+            if channel_choice == "all"
+            else sales_channel_label(channel_choice)
+        )
+        lines.append(f"Каналы продаж: {channel_label}")
     output_format = str(data.get("output_format") or "")
     lines.append(f"Формат: {FORMAT_LABELS.get(output_format, output_format)}")
     return "\n".join(lines)

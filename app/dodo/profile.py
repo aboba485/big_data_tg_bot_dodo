@@ -44,6 +44,8 @@ class ExecutionProfile(BaseModel):
     page_size: int = DEFAULT_PAGE_SIZE
     end_flag_path: str = END_FLAG_FIELD
     items_path: str = ""
+    empty_page_is_end: bool = False
+    single_array_collection_fallback: bool = False
     collection: str = ""
     collection_candidates: list[str] = Field(default_factory=list)
     path_parameters: list[str] = Field(default_factory=list)
@@ -79,6 +81,8 @@ class ExecutionProfile(BaseModel):
             "page_size": self.page_size,
             "end_flag_path": self.end_flag_path,
             "items_path": self.items_path,
+            "empty_page_is_end": self.empty_page_is_end,
+            "single_array_collection_fallback": self.single_array_collection_fallback,
         }
 
 
@@ -269,6 +273,8 @@ def _apply_override(profile: ExecutionProfile, override: dict[str, Any]) -> Exec
         ("page_size", "page_size"),
         ("end_flag_path", "end_flag_path"),
         ("items_path", "items_path"),
+        ("empty_page_is_end", "empty_page_is_end"),
+        ("single_array_collection_fallback", "single_array_collection_fallback"),
     ):
         if key in override:
             values[target] = override[key]

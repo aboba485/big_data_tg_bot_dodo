@@ -31,7 +31,9 @@ Both transports
 button and natural-language FSM flows, Telegram presentation, file delivery, and a single-process
 weekly scheduler. Button selections create a validated plan directly, without an LLM planning
 call. Unit selection is grouped by city after applying the current user's unit permissions, so
-the hierarchy cannot widen access. `app/main.py` retains the FastAPI routes during
+the hierarchy cannot widen access. A successfully validated natural-language plan is cached
+in memory for the FSM lifetime and consumed once after button confirmation, avoiding a second
+model call; report and unit permissions are rechecked before execution. `app/main.py` retains the FastAPI routes during
 the migration. `app/report_service.py` coordinates the report use case without transport logic
 or metric formulas.
 
@@ -73,6 +75,10 @@ or metric formulas.
   arbitrary URL or execute requests.
 - Allowed `salesChannel`, `orderSource`, and `paymentMethod` filters are applied to fetched
   records before deterministic aggregation; user text is never converted into SQL.
+- Sales-channel capability is derived from normalized endpoint response fields and query
+  parameters. Russian channel names are canonicalized locally. Response-backed endpoints can
+  be grouped by channel; filter-only aggregate endpoints receive the validated value through
+  their documented `salesChannel` or `salesChannels` parameter.
 - Telegram permissions use metric IDs for registered reports and operation IDs for validated
   raw/dynamic reports.
 - In public mode unknown private-chat users receive an ephemeral viewer identity. Public viewers
@@ -82,6 +88,9 @@ or metric formulas.
   profiles, allowlist rules, date/unit chunking, and pagination.
 - Reporting consumes validated plans and fetched records; metric formulas remain deterministic
   Python/configuration rather than model-generated expressions.
+- Service composition validates every registered metric against the indexed endpoint, strict
+  allowlist, execution profile, documented response fields, aggregation inputs, pagination
+  contract, granularities, and groups before the transports start accepting reports.
 - Storage is an adapter used by composition/orchestration and does not drive planning or domain
   calculations.
 - Weekly subscriptions store no tokens. The scheduler rechecks current report and unit access,

@@ -100,6 +100,7 @@ class WeeklyReportScheduler:
                 date_to=date_to,
                 output_format=run_format,
                 granularity=Granularity(subscription.granularity or Granularity.TOTAL.value),
+                sales_channel_choice=subscription.sales_channel_choice or None,
             )
             if result.status != "ready":
                 raise RuntimeError(result.reason or result.question or "Отчёт не сформирован")

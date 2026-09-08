@@ -6,6 +6,13 @@ from typing import Any, Protocol
 
 from app.documentation.models import EndpointDocument
 from app.documentation.repository import DocumentationRepository
+from app.dodo.channels import (
+    SALES_CHANNEL_FILTER,
+    SALES_CHANNEL_GROUP,
+    endpoint_sales_channel_capability,
+    sales_channel_key,
+    serialize_sales_channel,
+)
 from app.dodo.chunker import chunk_dates, chunk_units, report_buckets
 from app.dodo.paginator import paginate
 from app.dodo.profile import ROOT_COLLECTION, ProfileResolver
@@ -135,6 +142,7 @@ class DodoExecutor:
                 for date_range in ranges:
                     for units in unit_groups:
                         params = self._params(override, units, date_range.start, date_range.end)
+                        applied_filters = self._bind_operation_filters(operation, params, plan)
                         if override.get("pagination"):
                             dedup = next(
                                 (
@@ -155,7 +163,12 @@ class DodoExecutor:
                                     operation_document, {**base_params, **page}
                                 )
 
-                            items = await paginate(fetch, override, deduplication_field=dedup)
+                            items = await paginate(
+                                fetch,
+                                override,
+                                deduplication_field=dedup,
+                                operation_id=operation_id,
+                            )
                             payload: dict[str, Any] = {
                                 str(override["items_path"]): items,
                                 str(override.get("end_flag_path", "isEndOfListReached")): True,
@@ -170,6 +183,8 @@ class DodoExecutor:
                             record["__period_end"] = plan.date_to.isoformat()
                             if "unitId" not in record and len(units) == 1:
                                 record["unitId"] = units[0]
+                            if applied_filters:
+                                record["__applied_filters"] = sorted(applied_filters)
                         result[operation_id].extend(records)
         return result
 
@@ -239,6 +254,7 @@ class DodoExecutor:
                         )
                         params[str(profile.from_parameter)] = start
                         params[str(profile.to_parameter)] = end
+                    applied_filters = self._bind_operation_filters(operation, params, plan)
                     if override.get("pagination"):
 
                         async def fetch(
@@ -249,7 +265,7 @@ class DodoExecutor:
                         ) -> dict[str, Any]:
                             return await self.client.request_operation(op, {**base, **page}, path)
 
-                        items = await paginate(fetch, override)
+                        items = await paginate(fetch, override, operation_id=operation_id)
                         payload: dict[str, Any] = {
                             str(override.get("items_path", collection)): items,
                             str(override.get("end_flag_path", "isEndOfListReached")): True,
@@ -258,7 +274,14 @@ class DodoExecutor:
                         payload = await self.client.request_operation(
                             operation, params, path_arguments
                         )
-                    for record in _extract_records(payload, collection):
+                    extracted = _extract_records(payload, collection)
+                    extracted = self._expand_dynamic_channel_records(
+                        operation,
+                        collection,
+                        extracted,
+                        plan,
+                    )
+                    for record in extracted:
                         if plan.date_from and plan.date_to:
                             record.setdefault("__period_start", plan.date_from.isoformat())
                             record.setdefault("__period_end", plan.date_to.isoformat())
@@ -266,6 +289,8 @@ class DodoExecutor:
                             record.setdefault("__bucket_end", plan.date_to.isoformat())
                         if "unitId" not in record and len(units) == 1:
                             record["unitId"] = units[0]
+                        if applied_filters:
+                            record["__applied_filters"] = sorted(applied_filters)
                         rows.append(record)
                         if len(rows) > self.raw_max_rows:
                             raise DodoApiError(
@@ -286,6 +311,68 @@ class DodoExecutor:
             str(override["to_parameter"]): to_value,
         }
 
+    @staticmethod
+    def _bind_operation_filters(
+        operation: EndpointDocument,
+        params: dict[str, Any],
+        plan: ReportPlan,
+    ) -> set[str]:
+        channel_filter = next(
+            (item for item in plan.filters if item.name == SALES_CHANNEL_FILTER),
+            None,
+        )
+        capability = endpoint_sales_channel_capability(operation)
+        if channel_filter is None or capability is None or capability.parameter is None:
+            return set()
+        if capability.parameter.enum and any(
+            not any(
+                sales_channel_key(str(candidate)) == sales_channel_key(value)
+                for candidate in capability.parameter.enum
+            )
+            for value in channel_filter.values
+        ):
+            return set()
+        if capability.parameter.name == SALES_CHANNEL_FILTER and len(channel_filter.values) != 1:
+            return set()
+        serialized = [
+            serialize_sales_channel(operation, capability.parameter, value)
+            for value in channel_filter.values
+        ]
+        params[capability.parameter.name] = ",".join(serialized)
+        return {SALES_CHANNEL_FILTER}
+
+    @staticmethod
+    def _expand_dynamic_channel_records(
+        operation: EndpointDocument,
+        collection: str,
+        records: list[dict[str, Any]],
+        plan: ReportPlan,
+    ) -> list[dict[str, Any]]:
+        wants_channels = SALES_CHANNEL_GROUP in plan.group_by or any(
+            item.name == SALES_CHANNEL_FILTER for item in plan.filters
+        )
+        if not wants_channels:
+            return records
+        nested_candidates = {
+            parts[-2]
+            for field in operation.response_fields
+            if field.path.replace("[]", "").split(".")[-1]
+            in {SALES_CHANNEL_FILTER, f"{SALES_CHANNEL_FILTER}Name"}
+            and len(parts := field.path.replace("[]", "").split(".")) >= 3
+            and parts[-2] != collection
+        }
+        if len(nested_candidates) > 1:
+            raise PlanValidationError("Каналы продаж находятся в разных коллекциях ответа")
+        nested = next(iter(nested_candidates), None)
+        if nested is None:
+            return records
+        return [
+            {**record, **child}
+            for record in records
+            for child in record.get(nested, [])
+            if isinstance(child, dict)
+        ]
+
     def _records(
         self,
         operation: EndpointDocument,
@@ -303,8 +390,10 @@ class DodoExecutor:
             value = value.get(part, []) if isinstance(value, dict) else []
         rows = value if isinstance(value, list) else [value] if isinstance(value, dict) else []
         nested = definitions[0].nested_collection if definitions else None
-        if plan.filters:
+        if plan.filters or SALES_CHANNEL_GROUP in plan.group_by:
             filter_names = {item.name for item in plan.filters}
+            if SALES_CHANNEL_GROUP in plan.group_by:
+                filter_names.add(SALES_CHANNEL_FILTER)
             nested_candidates = {
                 parts[-2]
                 for field in operation.response_fields

@@ -50,7 +50,7 @@ def _endpoint(name: str, **kwargs) -> EndpointDocument:
 
 @pytest.mark.parametrize("operation_id", sorted(OVERRIDES))
 def test_derived_profile_matches_curated_overrides(repository, operation_id: str) -> None:
-    """The heuristics must reproduce the hand-written config for the curated 11.
+    """The heuristics must reproduce the hand-written config for curated endpoints.
 
     These entries were verified against the live API, so they are the only
     ground truth available for judging the derivation rules.
@@ -153,6 +153,10 @@ def test_as_override_round_trips_executor_keys(repository) -> None:
         assert override["max_period_days"] == expected["max_period_days"]
         assert override["date_mode"] == expected["date_mode"]
         assert override["pagination"] == expected["pagination"]
+        assert override["empty_page_is_end"] is expected.get("empty_page_is_end", False)
+        assert override["single_array_collection_fallback"] is expected.get(
+            "single_array_collection_fallback", False
+        )
         if expected["date_mode"] != "none":
             assert override["from_parameter"] == expected["from_parameter"]
             assert override["to_parameter"] == expected["to_parameter"]

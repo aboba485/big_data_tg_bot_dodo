@@ -219,6 +219,68 @@ async def test_raw_mode_executes_uncurated_get_with_pagination(
 
 
 @pytest.mark.asyncio
+async def test_dough_consumption_treats_empty_unfinished_page_as_no_data(
+    repository, dynamic_settings
+) -> None:
+    requests: list[httpx.Request] = []
+    payload = {"consumption": [], "isEndOfListReached": False}
+    client = await _client(_transport(payload, requests), dynamic_settings, allow_all_get=True)
+    plan = ReportPlan(
+        status=PlanStatus.READY,
+        mode=PlanMode.RAW,
+        operation_ids=["get-dough-consumption"],
+        date_from=date(2026, 5, 1),
+        date_to=date(2026, 5, 31),
+        unit_references=[UNIT_ID],
+        raw_collection="consumption",
+    )
+
+    async with client.http_client:
+        records = await _executor(repository, client, dynamic_settings).execute(plan, [UNIT_ID])
+
+    assert records == {"get-dough-consumption": []}
+    assert len(requests) == 2
+    assert requests[0].url.params["skip"] == "0"
+    assert requests[0].url.params["take"] == "1000"
+
+
+@pytest.mark.asyncio
+async def test_dough_consumption_accepts_renamed_single_array_collection(
+    repository, dynamic_settings
+) -> None:
+    requests: list[httpx.Request] = []
+    payload = {
+        "serverRenamedCollection": [
+            {
+                "unitdId": UNIT_ID,
+                "fromLocal": "2026-05-01T10:00:00",
+                "toLocal": "2026-05-01T11:00:00",
+                "doughSize": 30,
+                "quantity": 12.5,
+                "measurementUnit": "Kilogram",
+            }
+        ],
+        "isEndOfListReached": True,
+    }
+    client = await _client(_transport(payload, requests), dynamic_settings, allow_all_get=True)
+    plan = ReportPlan(
+        status=PlanStatus.READY,
+        mode=PlanMode.RAW,
+        operation_ids=["get-dough-consumption"],
+        date_from=date(2026, 5, 1),
+        date_to=date(2026, 5, 31),
+        unit_references=[UNIT_ID],
+        raw_collection="consumption",
+    )
+
+    async with client.http_client:
+        records = await _executor(repository, client, dynamic_settings).execute(plan, [UNIT_ID])
+
+    assert records["get-dough-consumption"][0]["quantity"] == 12.5
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
 async def test_raw_mode_binds_operation_path_arguments(repository, dynamic_settings) -> None:
     requests: list[httpx.Request] = []
     client = await _client(
@@ -266,6 +328,16 @@ def test_validator_accepts_dynamic_plan(repository, dynamic_settings) -> None:
     validated = _validator(repository, dynamic_settings).validate(
         plan, _candidates(repository, "get-delivery-statistics"), [UNIT_ID]
     )
+    assert validated.mode == PlanMode.DYNAMIC
+
+
+def test_dynamic_plan_without_dates_asks_for_period(repository, dynamic_settings) -> None:
+    plan = _dynamic_plan(date_from=None, date_to=None)
+    validated = _validator(repository, dynamic_settings).validate(
+        plan, _candidates(repository, "get-delivery-statistics"), [UNIT_ID]
+    )
+    assert validated.status == PlanStatus.NEEDS_CLARIFICATION
+    assert validated.clarification_question == "За какой период нужен отчёт?"
     assert validated.mode == PlanMode.DYNAMIC
 
 

@@ -8,5 +8,7 @@ get-production-stop-sales-saleschannels: {max_units: 30, max_period_days: 31, da
 get-production-stop-sales-statistics-ingredients: {max_units: 30, max_period_days: 31, date_mode: datetime, from_parameter: from, to_parameter: to, pagination: false}
 get-production-unit-workload-by-orders: {max_units: 30, max_period_days: 14, date_mode: date, from_parameter: fromDate, to_parameter: toDate, pagination: true, skip_parameter: skip, take_parameter: take, page_size: 1000, end_flag_path: isEndOfListReached, items_path: unitWorkload}
 get-production-unit-workload-by-products: {max_units: 30, max_period_days: 14, date_mode: date, from_parameter: fromDate, to_parameter: toDate, pagination: true, skip_parameter: skip, take_parameter: take, page_size: 1000, end_flag_path: isEndOfListReached, items_path: unitWorkload}
+get-production-orders-handover-time-statistics: {max_units: 30, max_period_days: 31, date_mode: datetime, from_parameter: from, to_parameter: to, pagination: false}
 get-all-units: {max_units: 0, max_period_days: 0, date_mode: none, pagination: true, skip_parameter: skip, take_parameter: take, page_size: 1000, end_flag_path: isEndOfListReached, items_path: units}
-
+get-dough-consumption: {max_units: 30, max_period_days: 31, date_mode: date, from_parameter: fromDate, to_parameter: toDate, pagination: true, skip_parameter: skip, take_parameter: take, page_size: 1000, end_flag_path: isEndOfListReached, items_path: consumption, empty_page_is_end: true, single_array_collection_fallback: true}
+get-staff-meals: {max_units: 30, max_period_days: 31, date_mode: datetime, from_parameter: from, to_parameter: to, pagination: true, skip_parameter: skip, take_parameter: take, page_size: 1000, end_flag_path: isEndOfListReached, items_path: staffMeals}

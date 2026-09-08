@@ -136,6 +136,38 @@ class MockDodoApiClient:
                 ],
                 "isEndOfListReached": True,
             }
+        if operation_id == "get-production-orders-handover-time-statistics":
+            return {
+                "ordersHandoverStatistics": [
+                    {
+                        "unitId": unit,
+                        "unitName": "Тестовое заведение",
+                        "avgTrackingPendingTime": 30,
+                        "avgCookingTime": 600,
+                        "avgHeatedShelfTime": 120,
+                        "avgOrderHandoverTime": 750,
+                        "ordersCount": 20 * days,
+                    }
+                    for unit in units
+                ]
+            }
+        if operation_id == "get-staff-meals":
+            skip = int(query_params.get("skip", 0))
+            meals = [
+                {
+                    "unitId": unit,
+                    "unitName": "Тестовое заведение",
+                    "staffId": unit,
+                    "orderAcceptedAtLocal": datetime.combine(
+                        start, datetime.min.time()
+                    ).isoformat(),
+                    "productId": unit,
+                    "productName": "Пепперони",
+                    "price": 150.0 * days,
+                }
+                for unit in units
+            ]
+            return {"staffMeals": meals[skip:], "isEndOfListReached": True}
         if operation_id == "get-all-units":
             return {"units": [], "isEndOfListReached": True}
         # Returning an empty payload here would render a silently blank report,

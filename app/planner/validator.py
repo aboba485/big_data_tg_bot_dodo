@@ -5,6 +5,17 @@ from datetime import date, timedelta
 
 from app.documentation.models import EndpointCandidate, EndpointDocument
 from app.documentation.repository import DocumentationRepository
+from app.dodo.channels import (
+    SALES_CHANNEL_FILTER,
+    SALES_CHANNEL_GROUP,
+    SALES_CHANNEL_PARAMETER_NAMES,
+    SalesChannelCapability,
+    canonical_sales_channel,
+    common_sales_channel_capability,
+    endpoint_sales_channel_capability,
+    sales_channel_intent,
+    sales_channel_key,
+)
 from app.dodo.profile import ProfileResolver
 from app.errors import PlanValidationError
 from app.planner.schemas import (
@@ -12,6 +23,7 @@ from app.planner.schemas import (
     DynamicAggregation,
     PlanMode,
     PlanStatus,
+    ReportFilter,
     ReportPlan,
 )
 from app.reports.metric_registry import MetricRegistry
@@ -39,6 +51,9 @@ class ReportPlanValidator:
         self.profiles = profiles or ProfileResolver({})
 
     def apply_query_intent(self, plan: ReportPlan, query: str) -> ReportPlan:
+        if plan.status != PlanStatus.READY:
+            return plan
+        self._apply_sales_channel_query_intent(plan, query)
         if plan.status != PlanStatus.READY or plan.mode != PlanMode.RAW:
             return plan
         if len(plan.operation_ids) != 1:
@@ -127,6 +142,110 @@ class ReportPlanValidator:
         plan.selected_response_fields = []
         return plan
 
+    def sales_channel_capability(self, plan: ReportPlan) -> SalesChannelCapability | None:
+        if not plan.operation_ids:
+            return None
+        endpoints = [self.repository.get(operation_id) for operation_id in plan.operation_ids]
+        if any(endpoint is None for endpoint in endpoints):
+            return None
+        return common_sales_channel_capability(
+            [endpoint for endpoint in endpoints if endpoint is not None]
+        )
+
+    def apply_sales_channel_choice(self, plan: ReportPlan, choice: str) -> ReportPlan:
+        capability = self.sales_channel_capability(plan)
+        if capability is None:
+            raise PlanValidationError("Выбранный отчёт не поддерживает фильтр по каналу продаж")
+        plan.filters = [item for item in plan.filters if item.name != SALES_CHANNEL_FILTER]
+        plan.group_by = [item for item in plan.group_by if item != SALES_CHANNEL_GROUP]
+        plan.operation_arguments = [
+            item
+            for item in plan.operation_arguments
+            if item.name not in SALES_CHANNEL_PARAMETER_NAMES
+        ]
+        if choice == "all":
+            return plan
+        if choice == "split":
+            if not capability.can_group:
+                raise PlanValidationError("Endpoint поддерживает фильтр, но не разбивку по каналам")
+            plan.group_by.append(SALES_CHANNEL_GROUP)
+            return plan
+        channel = canonical_sales_channel(choice, capability.values)
+        if channel is None or not capability.can_filter:
+            raise PlanValidationError("Неизвестный или недоступный канал продаж")
+        plan.filters.append(ReportFilter(name=SALES_CHANNEL_FILTER, values=[channel]))
+        return plan
+
+    def _apply_sales_channel_query_intent(self, plan: ReportPlan, query: str) -> None:
+        plan.group_by = [
+            SALES_CHANNEL_GROUP
+            if sales_channel_key(item) in {"saleschannel", "saleschannels"}
+            else item
+            for item in plan.group_by
+        ]
+        capability = self.sales_channel_capability(plan)
+        if capability is not None:
+            for report_filter in plan.filters:
+                if report_filter.name != SALES_CHANNEL_FILTER:
+                    continue
+                report_filter.values = [
+                    canonical_sales_channel(value, capability.values) or value
+                    for value in report_filter.values
+                ]
+
+        intent = sales_channel_intent(query)
+        if intent.values:
+            if capability is None or not capability.can_filter:
+                if intent.channel_context:
+                    plan.status = PlanStatus.UNSUPPORTED
+                    plan.unsupported_reason = (
+                        "Выбранные показатели нельзя отфильтровать по каналу продаж"
+                    )
+                    return
+                plan.filters = [item for item in plan.filters if item.name != SALES_CHANNEL_FILTER]
+                plan.group_by = [item for item in plan.group_by if item != SALES_CHANNEL_GROUP]
+                plan.operation_arguments = [
+                    item
+                    for item in plan.operation_arguments
+                    if item.name not in SALES_CHANNEL_PARAMETER_NAMES
+                ]
+            else:
+                plan.filters = [item for item in plan.filters if item.name != SALES_CHANNEL_FILTER]
+                plan.filters.append(
+                    ReportFilter(
+                        name=SALES_CHANNEL_FILTER,
+                        values=[
+                            canonical_sales_channel(value, capability.values) or value
+                            for value in intent.values
+                        ],
+                    )
+                )
+        elif intent.all_together and capability is not None:
+            self.apply_sales_channel_choice(plan, "all")
+        if intent.split:
+            if capability is None or not capability.can_group:
+                plan.status = PlanStatus.UNSUPPORTED
+                plan.unsupported_reason = (
+                    "Endpoint позволяет выбрать канал, но не возвращает разбивку по каналам"
+                )
+                return
+            if SALES_CHANNEL_GROUP not in plan.group_by:
+                plan.group_by.append(SALES_CHANNEL_GROUP)
+
+        channel_metric = any(
+            self.registry.has(metric_id)
+            and SALES_CHANNEL_GROUP in self.registry.get(metric_id).groups
+            for metric_id in plan.metric_ids
+        )
+        if (
+            channel_metric
+            and capability is not None
+            and capability.can_group
+            and not intent.all_together
+            and SALES_CHANNEL_GROUP not in plan.group_by
+        ):
+            plan.group_by.append(SALES_CHANNEL_GROUP)
+
     def validate(
         self,
         plan: ReportPlan,
@@ -150,7 +269,9 @@ class ReportPlanValidator:
         if plan.dynamic_aggregation is not None or plan.raw_collection:
             raise PlanValidationError("Metrics-режим содержит поля другого режима")
         if not plan.date_from or not plan.date_to:
-            raise PlanValidationError("В плане отсутствует период")
+            plan.status = PlanStatus.NEEDS_CLARIFICATION
+            plan.clarification_question = "За какой период нужен отчёт?"
+            return plan
         if plan.date_from > plan.date_to:
             raise PlanValidationError("Начало периода находится после конца")
         if plan.date_to > date.today() + timedelta(days=366 * 5):
@@ -162,6 +283,7 @@ class ReportPlanValidator:
         if set(plan.operation_ids) != expected:
             raise PlanValidationError("Операции плана не соответствуют реестру метрик")
         endpoints = self._check_operations(plan, candidate_ids)
+        self._check_channel_grouping(plan, endpoints)
         self._check_response_fields(plan, endpoints)
         for metric_id in plan.metric_ids:
             definition = self.registry.get(metric_id)
@@ -206,6 +328,7 @@ class ReportPlanValidator:
         if plan.operation_ids[0] not in candidate_ids:
             raise PlanValidationError("Модель выбрала операцию вне списка кандидатов")
         endpoints = self._check_operations(plan, candidate_ids)
+        self._check_channel_grouping(plan, endpoints)
         self._check_filters(plan, endpoints)
         self._canonicalize_dynamic_aggregation(plan)
         for endpoint in endpoints:
@@ -226,7 +349,9 @@ class ReportPlanValidator:
                         plan, candidates, resolved_unit_ids, profile
                     )
             if profile.has_period and not (plan.date_from and plan.date_to):
-                raise PlanValidationError("В плане отсутствует период")
+                plan.status = PlanStatus.NEEDS_CLARIFICATION
+                plan.clarification_question = "За какой период нужен отчёт?"
+                return plan
             if (
                 agg.collection
                 and profile.collection_candidates
@@ -312,6 +437,7 @@ class ReportPlanValidator:
             plan.unsupported_reason = "Выбранный endpoint отсутствует среди найденных кандидатов"
             return plan
         endpoints = self._check_operations(plan, candidate_ids)
+        self._check_channel_grouping(plan, endpoints)
         self._check_filters(plan, endpoints)
         endpoint = endpoints[0]
         profile = self.profiles.resolve(endpoint)
@@ -372,8 +498,12 @@ class ReportPlanValidator:
     def _check_filters(self, plan: ReportPlan, endpoints: list[EndpointDocument]) -> None:
         if any(item.name not in ALLOWED_FILTERS or not item.values for item in plan.filters):
             raise PlanValidationError("План содержит неподдерживаемый или пустой фильтр")
-        if plan.mode != PlanMode.METRICS and plan.filters:
-            raise PlanValidationError("Фильтры поддерживаются только для зарегистрированных метрик")
+        if plan.mode != PlanMode.METRICS and any(
+            report_filter.name != SALES_CHANNEL_FILTER for report_filter in plan.filters
+        ):
+            raise PlanValidationError(
+                "Для незарегистрированных отчётов поддерживается только фильтр канала продаж"
+            )
         for report_filter in plan.filters:
             aliases = {report_filter.name, f"{report_filter.name}Name"}
             for endpoint in endpoints:
@@ -382,23 +512,56 @@ class ReportPlanValidator:
                     for field in endpoint.response_fields
                     if field.path.replace("[]", "").split(".")[-1] in aliases
                 ]
-                if not matching_fields:
+                channel_capability = (
+                    endpoint_sales_channel_capability(endpoint)
+                    if report_filter.name == SALES_CHANNEL_FILTER
+                    else None
+                )
+                matching_parameters = (
+                    [channel_capability.parameter]
+                    if channel_capability is not None and channel_capability.parameter is not None
+                    else []
+                )
+                if not matching_fields and not matching_parameters:
                     raise PlanValidationError(
                         f"Фильтр '{report_filter.name}' отсутствует в ответе "
                         f"операции '{endpoint.operation_id}'"
                     )
                 documented_values = {
-                    str(value).casefold() for field in matching_fields for value in field.enum
+                    sales_channel_key(str(value))
+                    if report_filter.name == SALES_CHANNEL_FILTER
+                    else str(value).casefold()
+                    for source in [*matching_fields, *matching_parameters]
+                    for value in source.enum
                 }
                 invalid_values = [
                     value
                     for value in report_filter.values
-                    if documented_values and str(value).casefold() not in documented_values
+                    if documented_values
+                    and (
+                        sales_channel_key(str(value))
+                        if report_filter.name == SALES_CHANNEL_FILTER
+                        else str(value).casefold()
+                    )
+                    not in documented_values
                 ]
                 if invalid_values:
                     raise PlanValidationError(
                         f"Фильтр '{report_filter.name}' содержит неизвестные значения"
                     )
+
+    @staticmethod
+    def _check_channel_grouping(
+        plan: ReportPlan,
+        endpoints: list[EndpointDocument],
+    ) -> None:
+        if SALES_CHANNEL_GROUP not in plan.group_by:
+            return
+        capability = common_sales_channel_capability(endpoints)
+        if capability is None or not capability.can_group:
+            raise PlanValidationError(
+                "Выбранные endpoints не возвращают разбивку по каналам продаж"
+            )
 
     def _check_operation_arguments(
         self,

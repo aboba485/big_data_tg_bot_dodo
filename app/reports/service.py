@@ -36,6 +36,18 @@ def _dynamic_to_definition(agg: DynamicAggregation, operation_id: str) -> Metric
         AggregationType.MIN: "min",
         AggregationType.MAX: "max",
     }
+    required_fields = list(
+        dict.fromkeys(
+            field
+            for field in (
+                agg.value_field,
+                agg.weight_field,
+                agg.numerator_field,
+                agg.denominator_field,
+            )
+            if field
+        )
+    )
     return MetricDefinition(
         operation_id=operation_id,
         collection=agg.collection,
@@ -44,7 +56,7 @@ def _dynamic_to_definition(agg: DynamicAggregation, operation_id: str) -> Metric
         weight_field=agg.weight_field,
         numerator_field=agg.numerator_field,
         denominator_field=agg.denominator_field,
-        required_fields=[agg.value_field],
+        required_fields=required_fields,
         granularities=["total", "hour", "day", "week", "month"],
         groups=["unit", "hour", "day", "week", "month"],
     )
@@ -90,7 +102,11 @@ class ReportAggregator:
             "paymentMethod": ("paymentMethod", "paymentMethodName"),
         }
         for report_filter in plan.filters:
-            accepted = {str(value).casefold() for value in report_filter.values}
+            sales_channel_filter = report_filter.name == "salesChannel"
+            accepted = {
+                ReportAggregator._normalized_filter_value(value, sales_channel_filter)
+                for value in report_filter.values
+            }
             if not accepted:
                 continue
             actual = next(
@@ -101,9 +117,21 @@ class ReportAggregator:
                 ),
                 None,
             )
-            if actual is None or str(actual).casefold() not in accepted:
+            if actual is None and report_filter.name in row.get("__applied_filters", []):
+                continue
+            if actual is None or (
+                ReportAggregator._normalized_filter_value(actual, sales_channel_filter)
+                not in accepted
+            ):
                 return False
         return True
+
+    @staticmethod
+    def _normalized_filter_value(value: Any, sales_channel: bool) -> str:
+        text = str(value).casefold().replace("ё", "е")
+        if sales_channel:
+            return "".join(character for character in text if character.isalnum())
+        return text
 
     def _raw_result(
         self, plan: ReportPlan, records_by_operation: dict[str, list[dict[str, Any]]]

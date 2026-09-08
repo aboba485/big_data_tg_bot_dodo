@@ -4,6 +4,8 @@ from collections.abc import Iterable
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from app.dodo.channels import sales_channel_label
+
 
 def keyboard(rows: Iterable[Iterable[tuple[str, str]]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -90,6 +92,20 @@ def granularity_keyboard(
         for value, label in GRANULARITY_LABELS.items()
         if value in allowed
     ]
+    rows.append([("Отмена", f"{prefix}:cancel")])
+    return keyboard(rows)
+
+
+def sales_channel_keyboard(
+    channels: Iterable[str],
+    *,
+    can_split: bool,
+    prefix: str = "report",
+) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = [[("Все каналы вместе", f"{prefix}:channel:all")]]
+    if can_split:
+        rows.append([("Разбить по каналам", f"{prefix}:channel:split")])
+    rows.extend([(sales_channel_label(value), f"{prefix}:channel:{value}")] for value in channels)
     rows.append([("Отмена", f"{prefix}:cancel")])
     return keyboard(rows)
 

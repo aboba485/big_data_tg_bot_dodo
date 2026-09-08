@@ -16,7 +16,7 @@ from app.bot.application import (
 from app.bot.middlewares.access import AccessMiddleware
 from app.bot.models import BotPreparation, BotReportResult
 from app.bot.services import BotReportService, PreparationContext
-from app.errors import ConfigurationError
+from app.errors import ConfigurationError, PlanValidationError
 from app.planner.schemas import OutputFormat, PlannerResult, PlanStatus, ReportPlan
 from app.reports.metric_registry import MetricRegistry
 from app.services import build_services
@@ -103,7 +103,26 @@ async def test_internal_database_error_is_hidden_from_user() -> None:
     assert await global_error_handler(event) is True
     public_text = message.answer.await_args.args[0]
     assert "RPT-" in public_text
+    assert "Причина: Не удалось выполнить запрос" in public_text
     assert "secret database path" not in public_text
+
+
+@pytest.mark.asyncio
+async def test_plan_validation_error_shows_reason_and_code() -> None:
+    message = SimpleNamespace(
+        from_user=SimpleNamespace(id=42),
+        answer=AsyncMock(),
+    )
+    update = SimpleNamespace(message=message, callback_query=None)
+    event = SimpleNamespace(
+        exception=PlanValidationError("Начало периода находится после конца"),
+        update=update,
+    )
+
+    assert await global_error_handler(event) is True
+    public_text = message.answer.await_args.args[0]
+    assert "Начало периода находится после конца" in public_text
+    assert "RPT-" in public_text
 
 
 @pytest.mark.asyncio

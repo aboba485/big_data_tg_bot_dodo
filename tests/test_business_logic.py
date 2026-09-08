@@ -82,6 +82,67 @@ def test_mock_planner_ready_and_clarification() -> None:
     assert clarification.status == PlanStatus.NEEDS_CLARIFICATION
 
 
+def test_metrics_plan_without_dates_asks_for_period(settings) -> None:
+    repository = _repository(settings)
+    validator = ReportPlanValidator(
+        MetricRegistry(),
+        repository,
+        settings.allowed_operations,
+        allow_all_get=True,
+    )
+    operation_id = "get-finances-sales-daily-units"
+    plan = ReportPlan(
+        status=PlanStatus.READY,
+        metric_ids=["sales"],
+        operation_ids=[operation_id],
+        unit_references=[UNIT_ID],
+    )
+    validated = validator.validate(
+        plan,
+        [
+            EndpointCandidate(
+                operation_id=operation_id,
+                score=1,
+                compact_summary="sales",
+            )
+        ],
+        [UNIT_ID],
+    )
+    assert validated.status == PlanStatus.NEEDS_CLARIFICATION
+    assert validated.clarification_question == "За какой период нужен отчёт?"
+
+
+def test_metrics_plan_with_only_date_from_asks_for_period(settings) -> None:
+    repository = _repository(settings)
+    validator = ReportPlanValidator(
+        MetricRegistry(),
+        repository,
+        settings.allowed_operations,
+        allow_all_get=True,
+    )
+    operation_id = "get-finances-sales-daily-units"
+    plan = ReportPlan(
+        status=PlanStatus.READY,
+        metric_ids=["sales"],
+        operation_ids=[operation_id],
+        date_from=date(2026, 6, 1),
+        unit_references=[UNIT_ID],
+    )
+    validated = validator.validate(
+        plan,
+        [
+            EndpointCandidate(
+                operation_id=operation_id,
+                score=1,
+                compact_summary="sales",
+            )
+        ],
+        [UNIT_ID],
+    )
+    assert validated.status == PlanStatus.NEEDS_CLARIFICATION
+    assert validated.clarification_question == "За какой период нужен отчёт?"
+
+
 def test_report_filter_schema_rejects_unit_filter() -> None:
     with pytest.raises(ValueError):
         ReportFilter(name="unitName", values=["Подольск-1"])  # type: ignore[arg-type]
@@ -490,12 +551,171 @@ async def test_pagination_and_deduplication() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pagination_rejects_empty_unfinished_page() -> None:
+async def test_pagination_rejects_empty_unfinished_page_by_default() -> None:
+    calls = 0
+
     async def fetch(_params):
+        nonlocal calls
+        calls += 1
         return {"items": [], "done": False}
 
-    with pytest.raises(DodoApiError, match="пустую"):
+    with pytest.raises(DodoApiError, match="пустую страницу"):
         await paginate(fetch, {"items_path": "items", "end_flag_path": "done"})
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_pagination_recovers_when_retry_after_empty_page_has_data() -> None:
+    pages = [
+        {"items": [], "done": False},
+        {"items": [{"id": 1}], "done": True},
+    ]
+
+    async def fetch(_params):
+        return pages.pop(0)
+
+    result = await paginate(
+        fetch,
+        {
+            "items_path": "items",
+            "end_flag_path": "done",
+            "empty_page_is_end": True,
+        },
+    )
+
+    assert result == [{"id": 1}]
+
+
+@pytest.mark.asyncio
+async def test_pagination_rejects_renamed_single_array_by_default() -> None:
+    async def fetch(_params):
+        return {"renamed": [{"id": 1}], "done": True}
+
+    with pytest.raises(DodoApiError, match="коллекцию пагинации"):
+        await paginate(fetch, {"items_path": "items", "end_flag_path": "done"})
+
+
+@pytest.mark.asyncio
+async def test_pagination_accepts_unambiguous_single_array_with_opt_in(caplog) -> None:
+    async def fetch(_params):
+        return {"renamed": [{"id": 1}], "done": True}
+
+    with caplog.at_level("WARNING", logger="app.dodo.paginator"):
+        result = await paginate(
+            fetch,
+            {
+                "items_path": "items",
+                "end_flag_path": "done",
+                "single_array_collection_fallback": True,
+            },
+            operation_id="example",
+        )
+
+    assert result == [{"id": 1}]
+    assert "used configured single-array fallback operation=example" in caplog.text
+    assert "renamed" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"items": None, "done": True},
+        {"items": None, "renamed": [], "done": True},
+        {"first": [], "second": [], "done": True},
+        {"renamed": [], "metadata": {}, "done": True},
+        {"renamed": [], "finished": True},
+        {"renamed": [], "done": None},
+    ],
+)
+async def test_single_array_fallback_rejects_ambiguous_or_malformed_payload(payload) -> None:
+    async def fetch(_params):
+        return payload
+
+    with pytest.raises(DodoApiError, match="пагинации"):
+        await paginate(
+            fetch,
+            {
+                "items_path": "items",
+                "end_flag_path": "done",
+                "single_array_collection_fallback": True,
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_pagination_logs_only_bounded_response_shape(caplog) -> None:
+    payload = {
+        "data": {"consumption": []},
+        "unsafe key": "must-not-be-logged",
+        "token": "also-must-not-be-logged",
+    }
+
+    async def fetch(_params):
+        return payload
+
+    with (
+        caplog.at_level("WARNING", logger="app.dodo.paginator"),
+        pytest.raises(DodoApiError) as error,
+    ):
+        await paginate(
+            fetch,
+            {"items_path": "consumption", "end_flag_path": "done"},
+            operation_id="get-dough-consumption",
+        )
+
+    shape = error.value.details["response_shape"]
+    assert "$.data:object" in shape
+    assert "$.data.consumption:array" in shape
+    assert "$.<redacted-key>:string" in shape
+    assert "get-dough-consumption" in caplog.text
+    assert "token" not in caplog.text
+    assert "must-not-be-logged" not in caplog.text
+    assert "also-must-not-be-logged" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_pagination_does_not_log_shape_for_valid_payload(caplog) -> None:
+    async def fetch(_params):
+        return {"items": [], "done": True}
+
+    with caplog.at_level("WARNING", logger="app.dodo.paginator"):
+        assert (
+            await paginate(
+                fetch,
+                {"items_path": "items", "end_flag_path": "done"},
+                operation_id="example",
+            )
+            == []
+        )
+
+    assert "shape mismatch" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"done": False},
+        {"items": None, "done": False},
+        {"items": {}, "done": False},
+        {"items": [], "done": None},
+        {"items": [], "done": 0},
+    ],
+)
+async def test_pagination_rejects_malformed_payload(payload) -> None:
+    async def fetch(_params):
+        return payload
+
+    with pytest.raises(DodoApiError, match="пагинации"):
+        await paginate(
+            fetch,
+            {
+                "items_path": "items",
+                "end_flag_path": "done",
+            },
+        )
 
 
 @pytest.mark.asyncio

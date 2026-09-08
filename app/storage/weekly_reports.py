@@ -49,6 +49,7 @@ class ScheduledReportSubscription:
     spreadsheet_id: str | None = None
     frequency: str = "weekly"
     day_of_month: int | None = None
+    sales_channel_choice: str = ""
 
 
 # Alias for backward compatibility
@@ -142,6 +143,7 @@ class WeeklyReportRepository:
         granularity: str = "total",
         frequency: str = "weekly",
         day_of_month: int | None = None,
+        sales_channel_choice: str = "",
         now_utc: datetime | None = None,
         max_per_user: int = 10,
     ) -> ScheduledReportSubscription:
@@ -156,7 +158,8 @@ class WeeklyReportRepository:
                 existing = connection.execute(
                     """SELECT id FROM weekly_report_subscriptions
                     WHERE telegram_id=? AND metric_id=? AND unit_id=? AND output_format=?
-                      AND granularity=? AND frequency=? AND day_of_month=? AND local_hour=?
+                      AND granularity=? AND sales_channel_choice=? AND frequency=?
+                      AND day_of_month=? AND local_hour=?
                       AND timezone=? AND enabled=1""",
                     (
                         telegram_id,
@@ -164,6 +167,7 @@ class WeeklyReportRepository:
                         unit_id,
                         output_format,
                         granularity,
+                        sales_channel_choice,
                         frequency,
                         day_of_month,
                         local_hour,
@@ -174,7 +178,8 @@ class WeeklyReportRepository:
                 existing = connection.execute(
                     """SELECT id FROM weekly_report_subscriptions
                     WHERE telegram_id=? AND metric_id=? AND unit_id=? AND output_format=?
-                      AND granularity=? AND frequency=? AND weekday=? AND local_hour=?
+                      AND granularity=? AND sales_channel_choice=? AND frequency=?
+                      AND weekday=? AND local_hour=?
                       AND timezone=? AND enabled=1""",
                     (
                         telegram_id,
@@ -182,6 +187,7 @@ class WeeklyReportRepository:
                         unit_id,
                         output_format,
                         granularity,
+                        sales_channel_choice,
                         frequency,
                         weekday,
                         local_hour,
@@ -205,9 +211,9 @@ class WeeklyReportRepository:
                 cursor = connection.execute(
                     """INSERT INTO weekly_report_subscriptions
                     (telegram_id, chat_id, metric_id, unit_id, output_format, granularity,
-                     weekday, local_hour, timezone, next_run_at, frequency, day_of_month,
-                     created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     sales_channel_choice, weekday, local_hour, timezone, next_run_at, frequency,
+                     day_of_month, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         telegram_id,
                         chat_id,
@@ -215,6 +221,7 @@ class WeeklyReportRepository:
                         unit_id,
                         output_format,
                         granularity,
+                        sales_channel_choice,
                         weekday,
                         local_hour,
                         timezone_name,
@@ -371,4 +378,7 @@ class WeeklyReportRepository:
             day_of_month=int(row["day_of_month"])
             if "day_of_month" in keys and row["day_of_month"] is not None
             else None,
+            sales_channel_choice=str(row["sales_channel_choice"])
+            if "sales_channel_choice" in keys and row["sales_channel_choice"]
+            else "",
         )

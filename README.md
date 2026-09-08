@@ -100,7 +100,10 @@ python main.py
 - `/cancel` — отмена текущего диалога.
 
 Основной сценарий работает через inline-кнопки: город → заведение → категория → тип отчёта →
-период → формат → подтверждение. Свободный текст также поддерживается. Еженедельная
+период → детализация → канал продаж, если он поддерживается → формат → подтверждение.
+Свободный текст также поддерживается. Если канал уже указан в запросе (`доставка`,
+`ресторан/зал`, `самовывоз`), backend применяет его как проверенный фильтр; иначе бот
+предлагает общую сумму, разбивку по каналам или один конкретный канал. Еженедельная
 подписка присылает выбранный отчёт за предыдущую завершённую неделю (понедельник–
 воскресенье) в выбранный день и целый час от `06:00` до `22:00`. Время
 интерпретируется в `APP_TIMEZONE`.
@@ -346,7 +349,8 @@ Download принимает только случайный report ID из ба�
 - `vouchers_count`;
 - `ingredient_stops_count`, `ingredient_stop_duration_hours`;
 - `channel_stops_count`, `channel_stop_duration_hours`;
-- `workload_orders_count`, `workload_products_count`.
+- `workload_orders_count`, `workload_products_count`;
+- `average_order_handover_time_seconds`, `staff_meals_cost`.
 
 `average_check` считается как `sum(sales) / sum(ordersCount)`, а не среднее дневных
 значений. Проценты считаются из сумм компонентов. Средние времена объединяются
@@ -369,6 +373,8 @@ get-production-stop-sales-saleschannels
 get-production-stop-sales-statistics-ingredients
 get-production-unit-workload-by-orders
 get-production-unit-workload-by-products
+get-production-orders-handover-time-statistics
+get-staff-meals
 get-all-units
 ```
 
@@ -429,7 +435,7 @@ ALLOW_ALL_GET_OPERATIONS=true
 Запросы к операциям, на которые у токена нет прав, ожидаемо завершатся ошибкой 403.
 В `details.required_scopes` возвращается список scopes, которых не хватает токену.
 
-Mock-режим покрывает только одиннадцать курируемых операций. Для остальных
+Mock-режим покрывает тринадцать курируемых операций. Для остальных
 `DODO_MOCK_MODE=true` вернёт понятную ошибку: их нужно вызывать с реальным
 `DODO_ACCESS_TOKEN`.
 
@@ -451,6 +457,11 @@ uv run ruff format --check .
 
 Тесты не обращаются к реальным OpenAI/Dodo API. Используются mock planner,
 `httpx.MockTransport`, настоящий SQLite FTS5 и mock Dodo pipeline.
+Проверка контрактов автоматически прогоняет все зарегистрированные метрики через
+документацию, allowlist, профили выполнения, агрегацию, доступные детализации и группировки,
+а также CSV/XLSX-экспорт. Та же сверка конфигурации выполняется при старте приложения, чтобы
+ошибка в `metrics.yaml` или расхождение с локальной документацией обнаруживались до первого
+пользовательского отчёта.
 
 ## Docker
 
@@ -510,6 +521,9 @@ COMPATIBILITY_API_KEY=replace-with-a-long-random-value \
 - Пользовательский текст не вставляется через `innerHTML`.
 - SQL FTS выражение строится из очищенных токенов и передаётся параметром.
 - Все операции, метрики, поля, группы, фильтры и UUID проверяются backend-ом.
+- Каналы продаж и допустимые значения выводятся из схемы endpoint. Для агрегированных
+  endpoints без channel-поля выбранный канал передаётся в документированный параметр
+  `salesChannel`/`salesChannels`; разбивка предлагается только когда канал есть в ответе.
 - Retry ограничены; `429 Retry-After` и временные `5xx` обрабатываются.
 - Клиент не получает traceback.
 - В `report_runs` хранятся status, operation/metric IDs, counters, duration и usage.

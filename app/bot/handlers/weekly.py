@@ -17,12 +17,14 @@ from app.bot.keyboards import (
     granularity_keyboard,
     keyboard,
     main_menu,
+    sales_channel_keyboard,
     unit_cities_keyboard,
     units_multiselect_keyboard,
 )
 from app.bot.messages.texts import DRIVE_NOT_LINKED
 from app.bot.services import BotReportService
 from app.bot.states.reports import ScheduledReportForm
+from app.dodo.channels import sales_channel_label
 from app.planner.schemas import Granularity
 from app.storage.weekly_reports import (
     ScheduledReportLimitError,
@@ -112,6 +114,7 @@ async def weekly_query(
 ) -> None:
     await _ensure_active(state, bot_report_service)
     query = message.text or ""
+    await message.answer("⏳ Разбираю запрос…")
     preparation = await bot_report_service.prepare(telegram_user, query, defer_units=True)
     if preparation.status == "needs_clarification":
         await message.answer(preparation.question or "Уточните параметры отчёта.")
@@ -328,18 +331,28 @@ async def weekly_granularity(
         granularity=granularity.value,
         granularity_label=GRANULARITY_LABELS.get(granularity.value, granularity.value),
     )
-    await state.set_state(ScheduledReportForm.choosing_frequency)
-    if callback.message:
-        await callback.message.answer(
-            "Как часто присылать отчёт?",
-            reply_markup=keyboard(
-                [
-                    [("📅 Раз в неделю", "weekly:freq:weekly")],
-                    [("📆 Раз в месяц", "weekly:freq:monthly")],
-                    [("Отмена", "weekly:cancel")],
-                ]
-            ),
-        )
+    await _ask_channel_or_frequency(callback.message, state)
+
+
+@router.callback_query(ScheduledReportForm.choosing_channel, F.data.startswith("weekly:channel:"))
+async def weekly_sales_channel(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    choice = (callback.data or "").removeprefix("weekly:channel:")
+    data = await state.get_data()
+    preparation = data.get("preparation") or {}
+    options = [str(value) for value in preparation.get("sales_channel_options") or []]
+    can_split = bool(preparation.get("sales_channel_can_split"))
+    if choice not in {"all", *options} and not (choice == "split" and can_split):
+        raise BotInputError("Этот канал продаж недоступен.")
+    label = (
+        "Все каналы вместе"
+        if choice == "all"
+        else "Разбивка по каналам"
+        if choice == "split"
+        else sales_channel_label(choice)
+    )
+    await state.update_data(sales_channel_choice=choice, sales_channel_label=label)
+    await _ask_frequency(callback.message, state)
 
 
 @router.callback_query(ScheduledReportForm.choosing_frequency, F.data.startswith("weekly:freq:"))
@@ -482,6 +495,11 @@ async def weekly_confirm(
             unit_id=encode_subscription_unit_ids(unit_ids),
             output_format=output_format,
             granularity=str(data.get("granularity") or Granularity.TOTAL.value),
+            sales_channel_choice=str(
+                data.get("sales_channel_choice")
+                or (data.get("preparation") or {}).get("sales_channel_selection")
+                or ""
+            ),
             frequency=frequency,
             weekday=int(data.get("weekday") or 0),
             day_of_month=int(day_of_month) if day_of_month is not None else None,
@@ -545,8 +563,18 @@ async def _show_list(
         else:
             schedule_label = f"{WEEKDAYS[item.weekday]} {item.local_hour:02d}:00"
             freq_icon = "📅"
+        channel_label = ""
+        if item.sales_channel_choice:
+            channel_label = (
+                "разбивка по каналам"
+                if item.sales_channel_choice == "split"
+                else "все каналы вместе"
+                if item.sales_channel_choice == "all"
+                else sales_channel_label(item.sales_channel_choice)
+            )
         lines.append(
             f"#{item.id} {freq_icon}: {item.metric_id}, {unit_label}, {granularity_label}, "
+            f"{channel_label + ', ' if channel_label else ''}"
             f"{schedule_label}, "
             f"{FORMAT_LABELS.get(item.output_format, item.output_format)}"
         )
@@ -577,6 +605,46 @@ async def _show_cities(
     )
 
 
+async def _ask_channel_or_frequency(
+    message: Message | None,
+    state: FSMContext,
+) -> None:
+    if message is None:
+        return
+    data = await state.get_data()
+    preparation = data.get("preparation") or {}
+    options = [str(value) for value in preparation.get("sales_channel_options") or []]
+    selection = str(preparation.get("sales_channel_selection") or "")
+    if options and not selection:
+        await state.set_state(ScheduledReportForm.choosing_channel)
+        await message.answer(
+            "Как учитывать каналы продаж?",
+            reply_markup=sales_channel_keyboard(
+                options,
+                can_split=bool(preparation.get("sales_channel_can_split")),
+                prefix="weekly",
+            ),
+        )
+        return
+    await _ask_frequency(message, state)
+
+
+async def _ask_frequency(message: Message | None, state: FSMContext) -> None:
+    if message is None:
+        return
+    await state.set_state(ScheduledReportForm.choosing_frequency)
+    await message.answer(
+        "Как часто присылать отчёт?",
+        reply_markup=keyboard(
+            [
+                [("📅 Раз в неделю", "weekly:freq:weekly")],
+                [("📆 Раз в месяц", "weekly:freq:monthly")],
+                [("Отмена", "weekly:cancel")],
+            ]
+        ),
+    )
+
+
 def _confirmation(data: dict[str, object]) -> str:
     granularity = str(data.get("granularity") or "")
     granularity_label = data.get("granularity_label") or GRANULARITY_LABELS.get(
@@ -592,10 +660,25 @@ def _confirmation(data: dict[str, object]) -> str:
         weekday_idx = int(data.get("weekday") or 0)
         schedule_label = f"{WEEKDAYS[weekday_idx]}, {int(data['local_hour']):02d}:00"
         period_info = "Период каждого отчёта: предыдущая завершённая неделя (пн–вс)."
+    preparation = data.get("preparation") or {}
+    channel_choice = str(
+        data.get("sales_channel_choice") or preparation.get("sales_channel_selection") or ""
+    )
+    channel_line = ""
+    if channel_choice:
+        channel_label = (
+            "Разбивка по каналам"
+            if channel_choice == "split"
+            else "Все каналы вместе"
+            if channel_choice == "all"
+            else sales_channel_label(channel_choice)
+        )
+        channel_line = f"Каналы продаж: {channel_label}\n"
     return (
         f"Заведения: {data['unit_label']}\n"
         f"Отчёт: {data['metric_label']}\n"
         f"Детализация: {granularity_label}\n"
+        f"{channel_line}"
         f"Периодичность: {frequency_label}\n"
         f"Расписание: {schedule_label}\n"
         f"Формат: {FORMAT_LABELS.get(str(data['output_format']), str(data['output_format']))}\n"

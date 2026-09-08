@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import logging
 import re
@@ -18,8 +19,15 @@ from app.bot.messages.texts import DRIVE_NOT_CONFIGURED, DRIVE_NOT_LINKED
 from app.bot.models import BotPreparation, BotReportResult
 from app.config import Settings
 from app.documentation.models import EndpointCandidate
+from app.dodo.channels import (
+    DEFAULT_SALES_CHANNELS,
+    SALES_CHANNEL_FILTER,
+    SALES_CHANNEL_GROUP,
+    canonical_sales_channel,
+    sales_channel_label,
+)
 from app.dodo.units import UNIT_RE, UnitResolver
-from app.errors import GoogleDriveError
+from app.errors import GoogleDriveError, UnitResolutionError
 from app.google_drive.service import GoogleDriveService
 from app.planner.schemas import (
     Granularity,
@@ -33,6 +41,12 @@ from app.planner.service import PlannerService
 from app.planner.validator import ReportPlanValidator
 from app.report_service import ReportOrchestrator
 from app.reports.exporters import export_csv
+from app.reports.matrix import (
+    TOTAL_LABEL,
+    build_matrix,
+    is_total_label,
+    period_label_from_dates,
+)
 from app.reports.metric_registry import MetricRegistry
 from app.retrieval.normalizer import normalize_query
 from app.retrieval.service import RetrievalService
@@ -58,7 +72,9 @@ SQL_MARKER = re.compile(
 UUID_RE = re.compile(
     r"\b[0-9a-fA-F]{32}\b|\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b"
 )
+ALL_UNITS_PHRASE_RE = re.compile(r"\b(?:все|всем|всех)\s+(?:заведени\w*|ресторан\w*|пиццери\w*)\b")
 logger = logging.getLogger(__name__)
+MAX_PREPARED_CONTEXTS = 256
 
 
 @dataclass
@@ -106,6 +122,7 @@ class BotReportService:
             lambda: asyncio.Semaphore(settings.telegram_max_concurrent_reports_per_user)
         )
         self._in_flight: defaultdict[int, set[str]] = defaultdict(set)
+        self._prepared_contexts: dict[tuple[int, str], tuple[float, PreparationContext]] = {}
 
     def available_reports(self, user: TelegramUser) -> list[tuple[str, str]]:
         result = []
@@ -200,6 +217,8 @@ class BotReportService:
         defer_units: bool = False,
     ) -> BotPreparation:
         context = await self._prepare_context(user, query, output_format, defer_units=defer_units)
+        if defer_units and context.public.status == "ready":
+            self._store_prepared_context(user.telegram_id, query, context)
         return context.public
 
     async def _prepare_context(
@@ -211,6 +230,7 @@ class BotReportService:
         defer_units: bool = False,
         unit_ids_override: list[str] | None = None,
         granularity_override: Granularity | None = None,
+        sales_channel_choice_override: str | None = None,
     ) -> PreparationContext:
         query = self.validate_query(query)
         matched_reports = self.metrics.match_aliases(normalize_query(query))
@@ -225,11 +245,17 @@ class BotReportService:
             self.user_access.ensure_unit_access(user, mentioned_units)
         except PermissionError as exc:
             raise BotAccessError(str(exc)) from exc
+        has_all_units_phrase = bool(ALL_UNITS_PHRASE_RE.search(normalize_query(query)))
+        mentioned_city_units = []
+        if defer_units and not mentioned_units and has_all_units_phrase:
+            mentioned_city_units = self._mentioned_city_unit_ids(user, query)
 
         candidates = await self.retrieval.search_endpoints(query)
         planner_result = await self.planner.create_plan(query, candidates)
         plan = planner_result.plan
         self.validator.apply_query_intent(plan, query)
+        if sales_channel_choice_override is not None and plan.status == PlanStatus.READY:
+            self.validator.apply_sales_channel_choice(plan, sales_channel_choice_override)
         planned_report_types = (
             plan.metric_ids if plan.mode == PlanMode.METRICS else plan.operation_ids
         )
@@ -292,25 +318,42 @@ class BotReportService:
             if not unit_ids:
                 raise BotInputError("Не выбраны заведения.")
             plan.unit_references = unit_ids
+        elif mentioned_units:
+            unit_ids = mentioned_units
+            plan.unit_references = unit_ids
+        elif mentioned_city_units:
+            unit_ids = mentioned_city_units
+            plan.unit_references = unit_ids
+        elif defer_units and has_all_units_phrase:
+            plan.unit_references = []
+            unit_ids = []
         elif plan.unit_references or self.orchestrator.needs_units(plan):
-            resolution = self.resolver.resolve(plan.unit_references)
-            if resolution.status != "ready":
+            try:
+                resolution = self.resolver.resolve(plan.unit_references)
+            except UnitResolutionError:
                 if not defer_units:
-                    return PreparationContext(
-                        public=BotPreparation(
-                            status="needs_clarification",
-                            question=resolution.question or "По какому подразделению нужен отчёт?",
-                            report_types=planned_report_types,
-                            date_from=plan.date_from,
-                            date_to=plan.date_to,
-                        ),
-                        plan=plan,
-                        planner_result=planner_result,
-                        candidates=candidates,
-                    )
+                    raise
+                plan.unit_references = []
                 unit_ids = []
             else:
-                unit_ids = resolution.unit_ids
+                if resolution.status != "ready":
+                    if not defer_units:
+                        return PreparationContext(
+                            public=BotPreparation(
+                                status="needs_clarification",
+                                question=resolution.question
+                                or "По какому подразделению нужен отчёт?",
+                                report_types=planned_report_types,
+                                date_from=plan.date_from,
+                                date_to=plan.date_to,
+                            ),
+                            plan=plan,
+                            planner_result=planner_result,
+                            candidates=candidates,
+                        )
+                    unit_ids = []
+                else:
+                    unit_ids = resolution.unit_ids
 
         if granularity_override is not None:
             plan.granularity = granularity_override
@@ -352,7 +395,20 @@ class BotReportService:
         if plan.date_from is not None and plan.date_to is not None:
             self.validate_period(plan.date_from, plan.date_to)
         elif plan.date_from is not None or plan.date_to is not None:
-            raise BotInputError("Не удалось определить полный период отчёта.")
+            return PreparationContext(
+                public=BotPreparation(
+                    status="needs_clarification",
+                    question="За какой период нужен отчёт?",
+                    report_types=planned_report_types,
+                    unit_ids=unit_ids,
+                    date_from=plan.date_from,
+                    date_to=plan.date_to,
+                ),
+                plan=plan,
+                planner_result=planner_result,
+                candidates=candidates,
+                unit_ids=unit_ids,
+            )
         try:
             self.user_access.ensure_report_access(user, planned_report_types)
             if unit_ids:
@@ -366,6 +422,7 @@ class BotReportService:
                 unit_ids=unit_ids,
                 date_from=plan.date_from,
                 date_to=plan.date_to,
+                **self._sales_channel_preparation(plan),
             ),
             plan=plan,
             planner_result=planner_result,
@@ -380,13 +437,14 @@ class BotReportService:
         output_format: OutputFormat,
         unit_ids: list[str] | None = None,
         granularity: Granularity | None = None,
+        sales_channel_choice: str | None = None,
     ) -> BotReportResult:
         self._ensure_sheets_available(user, output_format)
         selected_units = list(dict.fromkeys(unit_ids or []))
         granularity_value = granularity.value if granularity is not None else ""
         fingerprint = hashlib.sha256(
             f"{query}\0{output_format.value}\0{','.join(sorted(selected_units))}\0"
-            f"{granularity_value}".encode()
+            f"{granularity_value}\0{sales_channel_choice or ''}".encode()
         ).hexdigest()
         limit = self._user_limits[user.telegram_id]
         if fingerprint in self._in_flight[user.telegram_id] or limit.locked():
@@ -397,13 +455,25 @@ class BotReportService:
         async with limit:
             self._in_flight[user.telegram_id].add(fingerprint)
             try:
-                context = await self._prepare_context(
-                    user,
-                    query,
-                    output_format,
-                    unit_ids_override=selected_units or None,
-                    granularity_override=granularity,
-                )
+                context = self._take_prepared_context(user.telegram_id, query)
+                if context is not None and selected_units:
+                    context = self._apply_cached_overrides(
+                        user,
+                        context,
+                        output_format,
+                        selected_units,
+                        granularity,
+                        sales_channel_choice,
+                    )
+                else:
+                    context = await self._prepare_context(
+                        user,
+                        query,
+                        output_format,
+                        unit_ids_override=selected_units or None,
+                        granularity_override=granularity,
+                        sales_channel_choice_override=sales_channel_choice,
+                    )
                 preparation = context.public
                 report_types = preparation.report_types
                 if preparation.status != "ready":
@@ -469,6 +539,7 @@ class BotReportService:
         date_to: date,
         output_format: OutputFormat,
         granularity: Granularity = Granularity.TOTAL,
+        sales_channel_choice: str | None = None,
     ) -> BotReportResult:
         if not self.metrics.has(metric_id):
             raise BotInputError("Неизвестный тип отчёта.")
@@ -505,6 +576,8 @@ class BotReportService:
             group_by=group_by,
             output_format=output_format,
         )
+        if sales_channel_choice is not None:
+            self.validator.apply_sales_channel_choice(plan, sales_channel_choice)
         candidate = EndpointCandidate(
             operation_id=endpoint.operation_id,
             score=1.0,
@@ -513,7 +586,7 @@ class BotReportService:
         self.validator.validate(plan, [candidate], unit_ids)
         fingerprint = hashlib.sha256(
             f"selected\0{metric_id}\0{','.join(sorted(unit_ids))}\0{date_from}\0{date_to}\0"
-            f"{granularity.value}\0{output_format.value}".encode()
+            f"{granularity.value}\0{output_format.value}\0{sales_channel_choice or ''}".encode()
         ).hexdigest()
         limit = self._user_limits[user.telegram_id]
         if fingerprint in self._in_flight[user.telegram_id] or limit.locked():
@@ -618,11 +691,7 @@ class BotReportService:
     @staticmethod
     def _period_label(response: dict[str, Any]) -> str | None:
         plan = response.get("plan") or {}
-        date_from = plan.get("date_from")
-        date_to = plan.get("date_to")
-        if date_from and date_to:
-            return f"{date_from} — {date_to}"
-        return None
+        return period_label_from_dates(plan.get("date_from"), plan.get("date_to"))
 
     def cleanup_file(self, report_id: str) -> None:
         try:
@@ -652,11 +721,29 @@ class BotReportService:
 
     def _format_response_text(self, response: dict[str, Any]) -> str:
         summary = str(response.get("summary") or "Отчёт сформирован.")
+        plan = response.get("plan") or {}
+        channel_values = [
+            str(value)
+            for report_filter in plan.get("filters") or []
+            if report_filter.get("name") == SALES_CHANNEL_FILTER
+            for value in report_filter.get("values") or []
+        ]
+        if channel_values:
+            labels = ", ".join(sales_channel_label(value) for value in channel_values)
+            summary = f"{summary}\nКанал продаж: {labels}."
         rows = response.get("rows") or []
         columns = response.get("columns") or []
         totals = response.get("totals") or {}
         if not rows or not columns:
             return summary
+        matrix = build_matrix(
+            list(columns),
+            list(rows),
+            dict(totals),
+            period_label=self._period_label(response),
+        )
+        if matrix is not None:
+            return self._format_matrix_text(summary, matrix)
         lines = [summary, ""]
         limit = self.settings.telegram_max_message_rows
         dimension_columns = {
@@ -713,6 +800,26 @@ class BotReportService:
             lines.extend(["", f"Итого: {', '.join(total_parts)}"])
         return "\n".join(lines)
 
+    def _format_matrix_text(self, summary: str, matrix: list[list[Any]]) -> str:
+        header = matrix[0] if matrix else []
+        dates = header[1:]
+        lines = [summary]
+        if dates:
+            lines.append(" | ".join(str(item) for item in dates))
+        limit = self.settings.telegram_max_message_rows
+        body = [row for row in matrix[1:] if row and not is_total_label(row[0])]
+        totals = [row for row in matrix[1:] if row and is_total_label(row[0])]
+        for row in body[:limit]:
+            values = " | ".join("" if item is None else str(item) for item in row[1:])
+            lines.append(f"{row[0]}: {values}")
+        if len(body) > limit:
+            lines.append(f"… ещё строк: {len(body) - limit}")
+        for row in totals:
+            values = " | ".join("" if item is None else str(item) for item in row[1:])
+            label = row[0] or TOTAL_LABEL
+            lines.append(f"{label}: {values}")
+        return "\n".join(lines)
+
     @staticmethod
     def _truncate_response(value: str) -> str:
         if len(value) <= 4000:
@@ -724,6 +831,141 @@ class BotReportService:
         found = list(UUID_RE.findall(query))
         found.extend(unit.unit_id for unit in self.resolver.recognize_in_query(query))
         return list(dict.fromkeys(found))
+
+    def _mentioned_city_unit_ids(self, user: TelegramUser, query: str) -> list[str]:
+        normalized = normalize_query(query)
+        if not ALL_UNITS_PHRASE_RE.search(normalized):
+            return []
+        padded_query = f" {normalized} "
+        result: list[str] = []
+        for city in self.available_unit_cities(user):
+            variants = self._city_query_variants(normalize_query(city.label))
+            if any(f" {variant} " in padded_query for variant in variants):
+                result.extend(unit_id for unit_id, _label in city.units)
+        return list(dict.fromkeys(result))
+
+    @staticmethod
+    def _city_query_variants(city: str) -> set[str]:
+        variants = {city}
+        if city.endswith("а"):
+            variants.update({f"{city[:-1]}ы", f"{city[:-1]}е"})
+        elif city.endswith("я"):
+            variants.update({f"{city[:-1]}и", f"{city[:-1]}е"})
+        elif city.endswith("ь"):
+            variants.add(f"{city[:-1]}и")
+        elif city and city[-1].isalpha():
+            variants.update({f"{city}а", f"{city}е"})
+        return variants
+
+    @staticmethod
+    def _prepared_key(telegram_id: int, query: str) -> tuple[int, str]:
+        digest = hashlib.sha256(query.strip().encode()).hexdigest()
+        return telegram_id, digest
+
+    def _store_prepared_context(
+        self, telegram_id: int, query: str, context: PreparationContext
+    ) -> None:
+        now = time.monotonic()
+        expired = [
+            key
+            for key, (expires_at, _context) in self._prepared_contexts.items()
+            if expires_at <= now
+        ]
+        for key in expired:
+            self._prepared_contexts.pop(key, None)
+        while len(self._prepared_contexts) >= MAX_PREPARED_CONTEXTS:
+            self._prepared_contexts.pop(next(iter(self._prepared_contexts)))
+        expires_at = now + self.settings.telegram_fsm_ttl_seconds
+        self._prepared_contexts[self._prepared_key(telegram_id, query)] = (
+            expires_at,
+            copy.deepcopy(context),
+        )
+
+    def _take_prepared_context(self, telegram_id: int, query: str) -> PreparationContext | None:
+        cached = self._prepared_contexts.pop(self._prepared_key(telegram_id, query), None)
+        if cached is None:
+            return None
+        expires_at, context = cached
+        if time.monotonic() >= expires_at:
+            return None
+        return context
+
+    def _apply_cached_overrides(
+        self,
+        user: TelegramUser,
+        context: PreparationContext,
+        output_format: OutputFormat,
+        unit_ids: list[str],
+        granularity: Granularity | None,
+        sales_channel_choice: str | None,
+    ) -> PreparationContext:
+        plan = context.plan
+        if plan is None or context.planner_result is None:
+            raise BotInputError("Подготовленный план отчёта отсутствует.")
+        plan.output_format = output_format
+        plan.unit_references = unit_ids
+        if granularity is not None:
+            plan.granularity = granularity
+            plan.group_by = [
+                item
+                for item in plan.group_by
+                if item not in {"day", "week", "month", "hour", "total"}
+            ]
+            if granularity != Granularity.TOTAL:
+                plan.group_by = [granularity.value, *plan.group_by]
+            for metric_id in plan.metric_ids:
+                definition = self.metrics.get(metric_id)
+                if granularity.value not in definition.granularities:
+                    raise BotInputError("Эта детализация недоступна для выбранного отчёта.")
+        if "unit" not in plan.group_by:
+            plan.group_by = [*plan.group_by, "unit"]
+        if sales_channel_choice is not None:
+            self.validator.apply_sales_channel_choice(plan, sales_channel_choice)
+        self.validator.validate(plan, context.candidates, unit_ids)
+        report_types = plan.metric_ids if plan.mode == PlanMode.METRICS else plan.operation_ids
+        try:
+            self.user_access.ensure_report_access(user, report_types)
+            self.user_access.ensure_unit_access(user, unit_ids)
+        except PermissionError as exc:
+            raise BotAccessError(str(exc)) from exc
+        if plan.date_from is not None and plan.date_to is not None:
+            self.validate_period(plan.date_from, plan.date_to)
+        context.unit_ids = unit_ids
+        context.public = BotPreparation(
+            status="ready",
+            report_types=report_types,
+            unit_ids=unit_ids,
+            date_from=plan.date_from,
+            date_to=plan.date_to,
+            **self._sales_channel_preparation(plan),
+        )
+        context.planner_result.plan = plan
+        return context
+
+    def _sales_channel_preparation(self, plan: ReportPlan) -> dict[str, Any]:
+        capability = self.validator.sales_channel_capability(plan)
+        if capability is None:
+            return {}
+        selected = next(
+            (
+                value
+                for report_filter in plan.filters
+                if report_filter.name == SALES_CHANNEL_FILTER
+                for value in report_filter.values
+            ),
+            "split" if SALES_CHANNEL_GROUP in plan.group_by else "",
+        )
+        suggested = [
+            value
+            for default in DEFAULT_SALES_CHANNELS
+            if (value := canonical_sales_channel(default, capability.values)) is not None
+        ]
+        suggested.extend(value for value in capability.values if value not in suggested)
+        return {
+            "sales_channel_options": suggested,
+            "sales_channel_can_split": capability.can_group,
+            "sales_channel_selection": selected,
+        }
 
     def _resolve_file(self, report_id: str) -> tuple[Path, str]:
         if not re.fullmatch(r"[0-9a-f]{32}", report_id):
@@ -749,6 +991,7 @@ class BotReportService:
                 list(response.get("columns") or []),
                 list(response.get("rows") or []),
                 dict(response.get("totals") or {}),
+                period_label=self._period_label(response),
             )
             self.files.add(
                 report_id,

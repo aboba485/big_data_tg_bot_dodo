@@ -53,6 +53,10 @@ UUID заведений записывай только в unit_references, да
 Если recognized_units не пуст, используй их unit_id и не спрашивай пользователя про UUID.
 Указанного в запросе известного названия заведения достаточно для готового плана.
 filters используй только для salesChannel, orderSource или paymentMethod.
+Для salesChannel используй значения из документации: Delivery, Dine-in, Takeaway,
+Staff meal или Tracker. Русские «доставка», «ресторан/зал», «самовывоз» означают
+Delivery, Dine-in и Takeaway соответственно. Если пользователь просит «по каналам» или
+«в разрезе каналов», добавь `sales channel` в group_by; конкретный канал добавляй в filters.
 Не дублируй в filters заведения, даты и группировки.
 В selected_response_fields включай поля, необходимые для агрегации.
 explanation — одна короткая фраза, не более 160 символов.

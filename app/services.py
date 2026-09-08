@@ -13,6 +13,7 @@ from app.dodo.oauth import DodoTokenRefresher
 from app.dodo.profile import ProfileResolver
 from app.dodo.units import UnitResolver
 from app.google_drive.service import GoogleDriveService
+from app.metric_contracts import validate_metric_contracts
 from app.planner.service import PlannerService
 from app.planner.validator import ReportPlanValidator
 from app.report_service import ReportOrchestrator
@@ -49,6 +50,7 @@ def build_services(settings: Settings, http_client: httpx.AsyncClient) -> dict[s
         settings.endpoint_overrides,
         default_max_period_days=settings.raw_default_max_period_days,
     )
+    validate_metric_contracts(metrics, repository, settings.allowed_operations, profiles)
     validator = ReportPlanValidator(
         metrics,
         repository,

@@ -13,12 +13,14 @@ from app.bot.handlers.reports import (
     choose_city_callback,
     choose_format,
     choose_granularity_callback,
+    choose_sales_channel_callback,
     clarify_report,
     confirm_report,
     natural_language_report,
     reports_help,
     units_action_callback,
 )
+from app.bot.keyboards import sales_channel_keyboard
 from app.bot.models import BotPreparation, BotReportResult
 from app.bot.services import UnitCity
 from app.bot.states.reports import ReportForm
@@ -164,6 +166,7 @@ async def test_natural_request_asks_for_city_then_units_after_prepare() -> None:
     query = FakeMessage(text="Покажи выручку за июнь по ресторану")
     await natural_language_report(query, state, _user(), service)  # type: ignore[arg-type]
 
+    assert query.answers[0] == ("⏳ Разбираю запрос…", None)
     assert state.state == ReportForm.choosing_city
     assert "выберите город" in query.answers[-1][0].casefold()
     assert query.answers[-1][1] is not None
@@ -286,6 +289,83 @@ async def test_granularity_moves_to_format() -> None:
 
 
 @pytest.mark.asyncio
+async def test_granularity_offers_channel_choice_for_capable_report() -> None:
+    state = FakeState(
+        data={
+            "started_at": 10**20,
+            "preparation": {
+                "report_types": ["sales"],
+                "sales_channel_options": ["Delivery", "Dine-in", "Takeaway"],
+                "sales_channel_can_split": True,
+            },
+        },
+        state=ReportForm.choosing_granularity,
+    )
+    service = _ready_service()
+    callback = FakeCallback(data="report:granularity:day")
+
+    await choose_granularity_callback(callback, state, _user(), service)  # type: ignore[arg-type]
+
+    assert state.state == ReportForm.choosing_channel
+    assert "каналы продаж" in callback.message.answers[-1][0].casefold()
+    callbacks = [
+        button.callback_data
+        for row in callback.message.answers[-1][1].inline_keyboard
+        for button in row
+    ]
+    assert "report:channel:all" in callbacks
+    assert "report:channel:split" in callbacks
+    assert "report:channel:Delivery" in callbacks
+
+
+@pytest.mark.parametrize(("prefix", "can_split"), [("report", True), ("weekly", False)])
+def test_sales_channel_keyboard_has_flat_button_rows(prefix: str, can_split: bool) -> None:
+    markup = sales_channel_keyboard(
+        ["Delivery", "Dine-in", "Takeaway"],
+        can_split=can_split,
+        prefix=prefix,
+    )
+
+    callbacks = [row[0].callback_data for row in markup.inline_keyboard]
+    expected = [f"{prefix}:channel:all"]
+    if can_split:
+        expected.append(f"{prefix}:channel:split")
+    expected.extend(
+        [
+            f"{prefix}:channel:Delivery",
+            f"{prefix}:channel:Dine-in",
+            f"{prefix}:channel:Takeaway",
+            f"{prefix}:cancel",
+        ]
+    )
+    assert callbacks == expected
+
+
+@pytest.mark.asyncio
+async def test_channel_choice_moves_to_format() -> None:
+    state = FakeState(
+        data={
+            "started_at": 10**20,
+            "preparation": {
+                "report_types": ["sales"],
+                "sales_channel_options": ["Delivery", "Dine-in", "Takeaway"],
+                "sales_channel_can_split": True,
+            },
+        },
+        state=ReportForm.choosing_channel,
+    )
+    service = _ready_service()
+    callback = FakeCallback(data="report:channel:Delivery")
+
+    await choose_sales_channel_callback(callback, state, _user(), service)  # type: ignore[arg-type]
+
+    assert state.state == ReportForm.choosing_format
+    assert state.data["sales_channel_choice"] == "Delivery"
+    assert state.data["sales_channel_label"] == "Доставка"
+    assert "формат" in callback.message.answers[-1][0].casefold()
+
+
+@pytest.mark.asyncio
 async def test_rejects_unsupported_granularity() -> None:
     state = FakeState(
         data={
@@ -344,6 +424,7 @@ async def test_text_only_flow_reaches_confirmation_and_delivers_report() -> None
         OutputFormat.CSV,
         unit_ids=["unit-1"],
         granularity=Granularity.WEEK,
+        sales_channel_choice=None,
     )
     # Report delivered, then asked if user wants to make it repeating
     assert "Готово" in confirmation.answers[-2][0]
