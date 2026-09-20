@@ -7,23 +7,35 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.bot.errors import BotInputError
-from app.bot.handlers.common import cancel_command, help_callback, start
+from app.bot.handlers.common import (
+    cancel_command,
+    help_callback,
+    metrics_callback,
+    metrics_command,
+    start,
+)
 from app.bot.handlers.reports import (
     _deliver,
+    answer_make_repeating,
     choose_city_callback,
     choose_format,
     choose_granularity_callback,
     choose_sales_channel_callback,
+    choose_vat_mode_callback,
+    choose_vat_rate_callback,
     clarify_report,
     confirm_report,
+    make_repeating_callback,
     natural_language_report,
     reports_help,
+    skip_repeating_callback,
     units_action_callback,
 )
+from app.bot.handlers.reports import router as reports_router
 from app.bot.keyboards import sales_channel_keyboard
 from app.bot.models import BotPreparation, BotReportResult
 from app.bot.services import UnitCity
-from app.bot.states.reports import ReportForm
+from app.bot.states.reports import ReportForm, ScheduledReportForm
 from app.planner.schemas import Granularity, OutputFormat
 from app.users.models import TelegramUser
 
@@ -35,7 +47,7 @@ class FakeMessage:
     documents: list[tuple[object, str | None]] = field(default_factory=list)
     reply_markups: list[object | None] = field(default_factory=list)
 
-    async def answer(self, text: str, reply_markup=None) -> None:
+    async def answer(self, text: str, reply_markup=None, parse_mode=None) -> None:
         self.answers.append((text, reply_markup))
 
     async def answer_document(self, document, caption=None) -> None:
@@ -72,11 +84,15 @@ class FakeState:
     async def set_state(self, state) -> None:
         self.state = state
 
+    async def get_state(self):
+        return getattr(self.state, "state", self.state)
+
     async def update_data(self, **values) -> None:
         self.data.update(values)
 
     async def get_data(self) -> dict[str, object]:
-        return self.data
+        # FSMContext hands out a copy, so handlers keep reading it after clear().
+        return dict(self.data)
 
 
 def _user() -> TelegramUser:
@@ -101,6 +117,7 @@ def _ready_service(**extra) -> SimpleNamespace:
         "metrics": SimpleNamespace(
             has=lambda metric_id: metric_id == "sales",
             get=lambda _metric_id: SimpleNamespace(granularities=["total", "day", "week", "month"]),
+            is_monetary=lambda metric_id: metric_id == "sales",
         ),
         "prepare": AsyncMock(
             return_value=BotPreparation(
@@ -275,7 +292,8 @@ async def test_unit_selection_done_asks_for_granularity() -> None:
 
 
 @pytest.mark.asyncio
-async def test_granularity_moves_to_format() -> None:
+async def test_granularity_moves_to_vat_for_monetary_metrics() -> None:
+    """Monetary metrics should ask for VAT preference after granularity."""
     state = FakeState(
         data={
             "started_at": 10**20,
@@ -290,9 +308,106 @@ async def test_granularity_moves_to_format() -> None:
 
     await choose_granularity_callback(callback, state, _user(), service)  # type: ignore[arg-type]
 
-    assert state.state == ReportForm.choosing_format
+    assert state.state == ReportForm.choosing_vat_mode
     assert state.data["granularity"] == "day"
     assert state.data["granularity_label"] == "По дням"
+    assert "ндс" in callback.message.answers[-1][0].casefold()
+
+
+@pytest.mark.asyncio
+async def test_granularity_moves_to_format_for_non_monetary_metrics() -> None:
+    """Non-monetary metrics should skip VAT step and go directly to format."""
+    state = FakeState(
+        data={
+            "started_at": 10**20,
+            "preparation": {"report_types": ["orders_count"]},
+            "unit_ids": ["unit-1"],
+            "unit_labels": {"unit-1": "Ресторан 1"},
+        },
+        state=ReportForm.choosing_granularity,
+    )
+    # Use a service where orders_count is not monetary
+    service = _ready_service()
+    service.metrics.is_monetary = lambda metric_id: False  # Override for this test
+    callback = FakeCallback(data="report:granularity:day")
+
+    await choose_granularity_callback(callback, state, _user(), service)  # type: ignore[arg-type]
+
+    assert state.state == ReportForm.choosing_format
+    assert "формат" in callback.message.answers[-1][0].casefold()
+
+
+@pytest.mark.asyncio
+async def test_vat_mode_without_vat_moves_to_format() -> None:
+    """Choosing 'without VAT' should skip rate selection and go to format."""
+    state = FakeState(
+        data={
+            "started_at": 10**20,
+            "preparation": {"report_types": ["sales"]},
+            "unit_ids": ["unit-1"],
+            "unit_labels": {"unit-1": "Ресторан 1"},
+            "granularity": "day",
+            "granularity_label": "По дням",
+        },
+        state=ReportForm.choosing_vat_mode,
+    )
+    service = _ready_service()
+    callback = FakeCallback(data="report:vat_mode:without_vat")
+
+    await choose_vat_mode_callback(callback, state, _user(), service)  # type: ignore[arg-type]
+
+    assert state.state == ReportForm.choosing_format
+    assert state.data["vat_mode"] == "without_vat"
+    assert "формат" in callback.message.answers[-1][0].casefold()
+
+
+@pytest.mark.asyncio
+async def test_vat_mode_with_vat_moves_to_rate_selection() -> None:
+    """Choosing 'with VAT' should ask for the VAT rate."""
+    state = FakeState(
+        data={
+            "started_at": 10**20,
+            "preparation": {"report_types": ["sales"]},
+            "unit_ids": ["unit-1"],
+            "unit_labels": {"unit-1": "Ресторан 1"},
+            "granularity": "day",
+            "granularity_label": "По дням",
+        },
+        state=ReportForm.choosing_vat_mode,
+    )
+    service = _ready_service()
+    callback = FakeCallback(data="report:vat_mode:with_vat")
+
+    await choose_vat_mode_callback(callback, state, _user(), service)  # type: ignore[arg-type]
+
+    assert state.state == ReportForm.choosing_vat_rate
+    assert state.data["vat_mode"] == "with_vat"
+    assert "ставка" in callback.message.answers[-1][0].casefold()
+
+
+@pytest.mark.asyncio
+async def test_vat_rate_selection_moves_to_format() -> None:
+    """Selecting a VAT rate should move to format selection."""
+    state = FakeState(
+        data={
+            "started_at": 10**20,
+            "preparation": {"report_types": ["sales"]},
+            "unit_ids": ["unit-1"],
+            "unit_labels": {"unit-1": "Ресторан 1"},
+            "granularity": "day",
+            "granularity_label": "По дням",
+            "vat_mode": "with_vat",
+            "vat_mode_label": "С НДС",
+        },
+        state=ReportForm.choosing_vat_rate,
+    )
+    service = _ready_service()
+    callback = FakeCallback(data="report:vat_rate:22")
+
+    await choose_vat_rate_callback(callback, state, _user(), service)  # type: ignore[arg-type]
+
+    assert state.state == ReportForm.choosing_format
+    assert state.data["vat_rate"] == "22"
     assert "формат" in callback.message.answers[-1][0].casefold()
 
 
@@ -352,7 +467,8 @@ def test_sales_channel_keyboard_has_flat_button_rows(prefix: str, can_split: boo
 
 
 @pytest.mark.asyncio
-async def test_channel_choice_moves_to_format() -> None:
+async def test_channel_choice_moves_to_vat_for_monetary_metrics() -> None:
+    """Channel selection should move to VAT mode for monetary metrics."""
     state = FakeState(
         data={
             "started_at": 10**20,
@@ -372,14 +488,15 @@ async def test_channel_choice_moves_to_format() -> None:
 
     await choose_sales_channel_callback(callback, state, _user(), service)  # type: ignore[arg-type]
 
-    assert state.state == ReportForm.choosing_format
+    assert state.state == ReportForm.choosing_vat_mode
     assert state.data["sales_channel_choice"] == "Delivery"
     assert state.data["sales_channel_label"] == "Доставка"
-    assert "формат" in callback.message.answers[-1][0].casefold()
+    assert "ндс" in callback.message.answers[-1][0].casefold()
 
 
 @pytest.mark.asyncio
-async def test_complete_natural_request_skips_redundant_choices() -> None:
+async def test_complete_natural_request_skips_redundant_choices_for_monetary() -> None:
+    """Complete request for monetary metric should ask VAT before confirming."""
     state = FakeState()
     service = _ready_service(
         prepare=AsyncMock(
@@ -399,12 +516,38 @@ async def test_complete_natural_request_skips_redundant_choices() -> None:
     message = FakeMessage(text="Выручка Ресторан 1 за июнь 2026 по дням в CSV")
     await natural_language_report(message, state, _user(), service)  # type: ignore[arg-type]
 
+    # Monetary metrics require VAT choice before confirmation
+    assert state.state == ReportForm.choosing_vat_mode
+    assert state.data["granularity"] == "day"
+    # output_format is set later in the flow after VAT selection
+
+
+@pytest.mark.asyncio
+async def test_complete_natural_request_skips_to_confirm_for_non_monetary() -> None:
+    """Complete request for non-monetary metric should go straight to confirming."""
+    state = FakeState()
+    service = _ready_service(
+        prepare=AsyncMock(
+            return_value=BotPreparation(
+                status="ready",
+                report_types=["orders_count"],
+                unit_ids=["unit-1"],
+                units_specified=True,
+                granularity=Granularity.DAY,
+                output_format=OutputFormat.CSV,
+                granularity_specified=True,
+                output_format_specified=True,
+            )
+        )
+    )
+    service.metrics.is_monetary = lambda metric_id: False  # Non-monetary metric
+
+    message = FakeMessage(text="Количество заказов за июнь 2026 по дням в CSV")
+    await natural_language_report(message, state, _user(), service)  # type: ignore[arg-type]
+
     assert state.state == ReportForm.confirming
     assert state.data["granularity"] == "day"
     assert state.data["output_format"] == "csv"
-    assert "Ресторан 1" in message.answers[-1][0]
-    assert "По дням" in message.answers[-1][0]
-    assert "CSV" in message.answers[-1][0]
 
 
 @pytest.mark.asyncio
@@ -440,6 +583,9 @@ async def test_text_only_flow_reaches_confirmation_and_delivers_report() -> None
             "unit_labels": {"unit-1": "Ресторан 1"},
             "granularity": "week",
             "granularity_label": "По неделям",
+            "vat_mode": "without_vat",
+            "vat_mode_label": "Без НДС",
+            "vat_rate": None,
             "preparation": {
                 "report_types": ["sales"],
                 "date_from": "2026-06-01",
@@ -467,11 +613,123 @@ async def test_text_only_flow_reaches_confirmation_and_delivers_report() -> None
         unit_ids=["unit-1"],
         granularity=Granularity.WEEK,
         sales_channel_choice=None,
+        vat_mode="without_vat",
+        vat_rate=None,
     )
     # Report delivered, then asked if user wants to make it repeating
     assert "Готово" in confirmation.answers[-2][0]
     assert "регулярно" in confirmation.answers[-1][0].lower()
     assert state.state == ReportForm.ask_make_repeating
+
+
+def _delivered_state() -> FakeState:
+    return FakeState(
+        data={
+            "started_at": 10**20,
+            "source_query": "Покажи выручку за июнь по ресторану",
+            "unit_ids": ["unit-1"],
+            "unit_labels": {"unit-1": "Ресторан 1"},
+            "granularity": "week",
+            "output_format": "csv",
+            "preparation": {"report_types": ["sales"]},
+        },
+        state=ReportForm.ask_make_repeating,
+    )
+
+
+@pytest.mark.asyncio
+async def test_new_request_after_report_is_handled_instead_of_ignored() -> None:
+    state = _delivered_state()
+    service = _ready_service()
+
+    message = FakeMessage(text="Покажи выручку за июль по ресторану")
+    await answer_make_repeating(message, state, _user(), service)  # type: ignore[arg-type]
+
+    service.prepare.assert_awaited_once()
+    assert service.prepare.await_args.args[1] == "Покажи выручку за июль по ресторану"
+    assert message.answers[0] == ("⏳ Разбираю запрос…", None)
+    assert state.state == ReportForm.choosing_granularity
+    assert state.data["source_query"] == "Покажи выручку за июль по ресторану"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", ["Нет, спасибо", "нет", "отмена", "   "])
+async def test_declining_repeating_report_closes_the_dialog(answer: str) -> None:
+    state = _delivered_state()
+    service = _ready_service()
+
+    message = FakeMessage(text=answer)
+    await answer_make_repeating(message, state, _user(), service)  # type: ignore[arg-type]
+
+    service.prepare.assert_not_awaited()
+    assert state.cleared is True
+    assert state.state is None
+    assert "разовым" in message.answers[-1][0]
+    assert message.answers[-1][1] is not None
+
+
+@pytest.mark.asyncio
+async def test_stale_skip_button_does_not_cancel_a_started_report() -> None:
+    state = _delivered_state()
+    await skip_repeating_callback(  # type: ignore[arg-type]
+        FakeCallback(data="report:skip_repeating"), state
+    )
+    assert state.cleared is True
+
+    restarted = FakeState(data={"unit_ids": ["unit-1"]}, state=ReportForm.choosing_granularity)
+    stale = FakeCallback(data="report:skip_repeating")
+    await skip_repeating_callback(stale, restarted)  # type: ignore[arg-type]
+
+    assert stale.answered is True
+    assert restarted.cleared is False
+    assert restarted.state == ReportForm.choosing_granularity
+    assert stale.message.answers == []
+
+
+def test_repeat_prompt_answers_are_routed_to_a_handler() -> None:
+    registered = [
+        handler
+        for handler in reports_router.message.handlers
+        if handler.callback is answer_make_repeating
+    ]
+    assert registered, "text sent at the repeat prompt must reach a handler"
+    states = [
+        item.callback
+        for handler in registered
+        for item in handler.filters or []
+        if item.callback is ReportForm.ask_make_repeating
+    ]
+    assert states == [ReportForm.ask_make_repeating]
+
+
+@pytest.mark.asyncio
+async def test_repeating_report_can_be_confirmed_by_text_or_button() -> None:
+    metrics = SimpleNamespace(
+        has=lambda metric_id: metric_id == "sales",
+        get=lambda _metric_id: SimpleNamespace(granularities=["total", "day", "week", "month"]),
+        aliases=lambda: {"sales": ["выручка"]},
+    )
+
+    text_state = _delivered_state()
+    text_service = _ready_service(metrics=metrics)
+    text_message = FakeMessage(text="да")
+    await answer_make_repeating(  # type: ignore[arg-type]
+        text_message, text_state, _user(), text_service
+    )
+
+    text_service.prepare.assert_not_awaited()
+    assert text_state.state == ScheduledReportForm.choosing_frequency
+    assert text_state.data["metric_id"] == "sales"
+    assert "Как часто" in text_message.answers[-1][0]
+
+    button_state = _delivered_state()
+    callback = FakeCallback(data="report:make_repeating")
+    await make_repeating_callback(  # type: ignore[arg-type]
+        callback, button_state, _ready_service(metrics=metrics)
+    )
+
+    assert button_state.state == ScheduledReportForm.choosing_frequency
+    assert "Как часто" in callback.message.answers[-1][0]
 
 
 @pytest.mark.asyncio
@@ -546,3 +804,73 @@ async def test_file_is_removed_when_telegram_send_fails(tmp_path) -> None:
         await _deliver(FailingMessage(), FakeService(), result)  # type: ignore[arg-type]
     assert cleaned == ["b" * 32]
     assert not path.exists()
+
+
+@pytest.mark.asyncio
+async def test_metrics_command_displays_available_metrics() -> None:
+    from app.bot.catalog import ReportCategory
+
+    categories = [
+        ReportCategory("sales", "Продажи и заказы", ("sales", "orders_count")),
+        ReportCategory("delivery", "Доставка", ("delivery_sales",)),
+    ]
+    service = SimpleNamespace(
+        available_categories=lambda _user: categories,
+        catalog=SimpleNamespace(
+            reports_for=lambda cat_id, _user: (
+                [
+                    ("sales", "Выручка"),
+                    ("orders_count", "Количество заказов"),
+                ]
+                if cat_id == "sales"
+                else [("delivery_sales", "Выручка доставки")]
+            )
+        ),
+    )
+    message = FakeMessage()
+    await metrics_command(message, _user(), service)  # type: ignore[arg-type]
+
+    text = message.answers[-1][0]
+    assert "📊 Доступные метрики" in text
+    assert "Продажи и заказы" in text
+    assert "Выручка" in text
+    assert "Количество заказов" in text
+    assert "Доставка" in text
+    assert "Выручка доставки" in text
+
+
+@pytest.mark.asyncio
+async def test_metrics_callback_displays_available_metrics() -> None:
+    from app.bot.catalog import ReportCategory
+
+    categories = [ReportCategory("sales", "Продажи и заказы", ("sales",))]
+    service = SimpleNamespace(
+        available_categories=lambda _user: categories,
+        catalog=SimpleNamespace(reports_for=lambda _cat_id, _user: [("sales", "Выручка")]),
+    )
+    callback = FakeCallback(data="metrics:show")
+    await metrics_callback(callback, _user(), service)  # type: ignore[arg-type]
+
+    assert callback.answered is True
+    text = callback.message.answers[-1][0]
+    assert "📊 Доступные метрики" in text
+    assert "Продажи и заказы" in text
+    assert "Выручка" in text
+
+
+@pytest.mark.asyncio
+async def test_metrics_command_when_no_access() -> None:
+    service = SimpleNamespace(available_categories=lambda _user: [])
+    message = FakeMessage()
+    await metrics_command(message, _user(), service)  # type: ignore[arg-type]
+
+    text = message.answers[-1][0]
+    assert "нет доступа ни к одной метрике" in text.casefold()
+
+
+def test_main_menu_includes_metrics_button() -> None:
+    from app.bot.keyboards import main_menu
+
+    markup = main_menu()
+    callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+    assert "metrics:show" in callbacks

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
+from openpyxl import load_workbook
 
 from app.bot.errors import BotAccessError, BotBusyError, BotInputError
 from app.bot.models import BotPreparation
@@ -20,6 +22,7 @@ from app.planner.schemas import (
     ReportFilter,
     ReportPlan,
 )
+from app.reports.exporters import export_csv, export_xlsx
 from app.services import build_services
 from app.users.models import TelegramRole, TelegramUser
 from tests.conftest import UNIT_ID
@@ -309,6 +312,18 @@ def test_units_are_grouped_by_city_with_natural_order_and_access_filter(settings
     restricted = _viewer(units=[second_id])
     restricted_cities = service.available_unit_cities(restricted)
     assert restricted_cities[0].units == ((second_id, "Москва 4-2"),)
+
+
+@pytest.mark.asyncio
+async def test_all_available_units_selected_when_no_city_mentioned(settings) -> None:
+    service = _bot_service(settings)
+    user = _viewer(units=[UNIT_ID])
+
+    preparation = await service.prepare(user, "Выручка за июнь 2026 по всем пиццериям", defer_units=True)
+
+    assert preparation.status == "ready"
+    assert preparation.unit_ids == [UNIT_ID]
+    assert preparation.units_specified is True
 
 
 @pytest.mark.asyncio
@@ -921,3 +936,193 @@ def test_response_text_includes_sales_channel_in_location(settings) -> None:
     assert "Смоленск-1 / Delivery: 100" in text
     assert "Смоленск-1 / Dine-in: 200" in text
     assert "Итого: 300" in text
+
+
+@pytest.mark.asyncio
+async def test_csv_download_is_rewritten_after_adding_vat(settings) -> None:
+    service = _bot_service(settings)
+    settings.reports_directory.mkdir(parents=True, exist_ok=True)
+    report_id = "a" * 32
+    path = settings.reports_directory / f"{report_id}.csv"
+    export_csv(
+        path,
+        ["unitName", "sales"],
+        [{"unitName": "Unit", "sales": 1000}],
+        {"sales": 1000},
+    )
+    service.files.get = Mock(return_value=(path, "text/csv"))
+
+    result = await service._result_from_response(
+        {
+            "status": "ready",
+            "request_id": "request-id",
+            "columns": ["unitName", "sales"],
+            "rows": [{"unitName": "Unit", "sales": 1000}],
+            "totals": {"sales": 1000},
+            "download": {"report_id": report_id},
+            "plan": {"metrics": ["sales"], "date_from": "2026-06-01", "date_to": "2026-06-30"},
+        },
+        output_format=OutputFormat.CSV,
+        telegram_id=1,
+        vat_mode="with_vat",
+        vat_rate="22",
+        report_types=["sales"],
+    )
+
+    assert result.response["rows"][0]["sales"] == 1220.0
+    assert result.response["totals"]["sales"] == 1220.0
+    text = path.read_text(encoding="utf-8-sig")
+    assert "1220" in text
+    assert "1000" not in text
+
+
+@pytest.mark.asyncio
+async def test_csv_download_stays_net_without_vat(settings) -> None:
+    service = _bot_service(settings)
+    settings.reports_directory.mkdir(parents=True, exist_ok=True)
+    report_id = "b" * 32
+    path = settings.reports_directory / f"{report_id}.csv"
+    export_csv(
+        path,
+        ["unitName", "sales"],
+        [{"unitName": "Unit", "sales": 1000}],
+        {"sales": 1000},
+    )
+    service.files.get = Mock(return_value=(path, "text/csv"))
+
+    result = await service._result_from_response(
+        {
+            "status": "ready",
+            "request_id": "request-id",
+            "columns": ["unitName", "sales"],
+            "rows": [{"unitName": "Unit", "sales": 1000}],
+            "totals": {"sales": 1000},
+            "download": {"report_id": report_id},
+        },
+        output_format=OutputFormat.CSV,
+        telegram_id=1,
+        vat_mode="without_vat",
+        vat_rate=None,
+        report_types=["sales"],
+    )
+
+    assert result.response["rows"][0]["sales"] == 1000
+    assert "1000" in path.read_text(encoding="utf-8-sig")
+
+
+@pytest.mark.asyncio
+async def test_xlsx_download_is_rewritten_after_adding_vat(settings) -> None:
+    service = _bot_service(settings)
+    settings.reports_directory.mkdir(parents=True, exist_ok=True)
+    report_id = "c" * 32
+    path = settings.reports_directory / f"{report_id}.xlsx"
+    export_xlsx(
+        path,
+        ["unitName", "sales"],
+        [{"unitName": "Unit", "sales": 1000}],
+        {"sales": 1000},
+    )
+    service.files.get = Mock(
+        return_value=(
+            path,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    )
+
+    result = await service._result_from_response(
+        {
+            "status": "ready",
+            "request_id": "request-id",
+            "columns": ["unitName", "sales"],
+            "rows": [{"unitName": "Unit", "sales": 1000}],
+            "totals": {"sales": 1000},
+            "download": {"report_id": report_id},
+            "plan": {"metrics": ["sales"], "date_from": "2026-06-01", "date_to": "2026-06-30"},
+        },
+        output_format=OutputFormat.XLSX,
+        telegram_id=1,
+        vat_mode="with_vat",
+        vat_rate="22",
+        report_types=["sales"],
+    )
+
+    assert result.response["rows"][0]["sales"] == 1220.0
+    assert result.response["totals"]["sales"] == 1220.0
+    values = [cell.value for row in load_workbook(path).active.iter_rows() for cell in row]
+    assert 1220.0 in values
+    assert 1000 not in values
+    assert 1000.0 not in values
+
+
+@pytest.mark.asyncio
+async def test_overflow_csv_uses_vat_adjusted_values(settings) -> None:
+    service = _bot_service(settings.model_copy(update={"telegram_max_message_rows": 1}))
+    stored: dict[str, tuple[object, str]] = {}
+
+    def add(report_id, _request_id, path, media_type) -> None:
+        stored[report_id] = (path, media_type)
+
+    service.files.add = add  # type: ignore[method-assign]
+    service.files.get = lambda report_id: stored.get(report_id)  # type: ignore[method-assign]
+
+    result = await service._result_from_response(
+        {
+            "status": "ready",
+            "request_id": "request-id",
+            "columns": ["unitName", "sales"],
+            "rows": [
+                {"unitName": "Unit A", "sales": 1000},
+                {"unitName": "Unit B", "sales": 2000},
+            ],
+            "totals": {"sales": 3000},
+            "plan": {"metrics": ["sales"], "date_from": "2026-06-01", "date_to": "2026-06-30"},
+        },
+        output_format=OutputFormat.TABLE,
+        telegram_id=1,
+        vat_mode="with_vat",
+        vat_rate="22",
+        report_types=["sales"],
+    )
+
+    assert result.response["rows"][0]["sales"] == 1220.0
+    assert result.response["rows"][1]["sales"] == 2440.0
+    assert result.file_path is not None and result.file_path.is_file()
+    text = result.file_path.read_text(encoding="utf-8-sig")
+    assert "1220" in text
+    assert "2440" in text
+    assert "3660" in text
+    assert "1000" not in text
+    assert "2000" not in text
+    assert "3000" not in text
+
+
+@pytest.mark.asyncio
+async def test_sheets_upload_uses_vat_adjusted_rows(settings) -> None:
+    service = _bot_service(settings)
+    service.google_drive = SimpleNamespace(
+        enabled=True,
+        create_spreadsheet=AsyncMock(
+            return_value=("https://docs.google.com/spreadsheets/d/sheet-1", "sheet-1")
+        ),
+    )
+
+    result = await service._result_from_response(
+        {
+            "status": "ready",
+            "request_id": "request-id",
+            "columns": ["unitName", "sales"],
+            "rows": [{"unitName": "Unit", "sales": 1000}],
+            "totals": {"sales": 1000},
+            "plan": {"metrics": ["sales"], "date_from": "2026-06-01", "date_to": "2026-06-30"},
+        },
+        output_format=OutputFormat.SHEETS,
+        telegram_id=1,
+        vat_mode="with_vat",
+        vat_rate="22",
+        report_types=["sales"],
+    )
+
+    assert result.sheet_url == "https://docs.google.com/spreadsheets/d/sheet-1"
+    kwargs = service.google_drive.create_spreadsheet.await_args.kwargs
+    assert kwargs["rows"][0]["sales"] == 1220.0
+    assert kwargs["totals"]["sales"] == 1220.0

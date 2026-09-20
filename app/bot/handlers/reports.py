@@ -12,6 +12,8 @@ from app.bot.errors import BotInputError
 from app.bot.keyboards import (
     FORMAT_LABELS,
     GRANULARITY_LABELS,
+    VAT_MODE_LABELS,
+    VAT_RATE_LABELS,
     allowed_formats,
     format_keyboard,
     granularity_keyboard,
@@ -20,8 +22,10 @@ from app.bot.keyboards import (
     sales_channel_keyboard,
     unit_cities_keyboard,
     units_multiselect_keyboard,
+    vat_mode_keyboard,
+    vat_rate_keyboard,
 )
-from app.bot.messages.texts import DRIVE_NOT_LINKED, HELP_TEXT
+from app.bot.messages.texts import DRIVE_NOT_LINKED, HELP_TEXT, VAT_MODE_PROMPT, VAT_RATE_PROMPT
 from app.bot.models import BotPreparation
 from app.bot.services import BotReportService
 from app.bot.states.reports import ReportForm, ScheduledReportForm
@@ -46,6 +50,21 @@ FORMAT_ALIASES = {
 CONFIRM_WORDS = {"да", "сформировать", "готово"}
 MODIFY_WORDS = {"изменить", "изменить параметры"}
 CANCEL_WORDS = {"отмена", "отменить"}
+SINGLE_REPORT_KEPT = "Хорошо, отчёт останется разовым."
+REPEAT_CONFIRM_WORDS = {"да", "ага", "хочу", "давай", "повторять", "сделать повторяющимся"}
+REPEAT_DECLINE_WORDS = {
+    "нет",
+    "не",
+    "неа",
+    "не хочу",
+    "не надо",
+    "не нужно",
+    "нет, спасибо",
+    "нет спасибо",
+    "спасибо",
+    "no",
+    *CANCEL_WORDS,
+}
 DEFAULT_GRANULARITIES = ["total", "day", "week", "month"]
 
 
@@ -253,6 +272,40 @@ async def choose_sales_channel_callback(
     await _advance_natural_flow(callback.message, state, telegram_user, bot_report_service)
 
 
+@router.callback_query(ReportForm.choosing_vat_mode, F.data.startswith("report:vat_mode:"))
+async def choose_vat_mode_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+    telegram_user: TelegramUser,
+    bot_report_service: BotReportService,
+) -> None:
+    await callback.answer()
+    await _ensure_active(state, bot_report_service)
+    choice = (callback.data or "").removeprefix("report:vat_mode:")
+    if choice not in VAT_MODE_LABELS:
+        raise BotInputError("Недопустимый режим НДС.")
+    label = VAT_MODE_LABELS[choice]
+    await state.update_data(vat_mode=choice, vat_mode_label=label)
+    await _advance_natural_flow(callback.message, state, telegram_user, bot_report_service)
+
+
+@router.callback_query(ReportForm.choosing_vat_rate, F.data.startswith("report:vat_rate:"))
+async def choose_vat_rate_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+    telegram_user: TelegramUser,
+    bot_report_service: BotReportService,
+) -> None:
+    await callback.answer()
+    await _ensure_active(state, bot_report_service)
+    choice = (callback.data or "").removeprefix("report:vat_rate:")
+    if choice not in VAT_RATE_LABELS:
+        raise BotInputError("Недопустимая ставка НДС.")
+    label = VAT_RATE_LABELS[choice]
+    await state.update_data(vat_rate=choice, vat_rate_label=label)
+    await _advance_natural_flow(callback.message, state, telegram_user, bot_report_service)
+
+
 @router.callback_query(ReportForm.choosing_format, F.data.startswith("report:format:"))
 async def choose_format_callback(
     callback: CallbackQuery,
@@ -299,6 +352,8 @@ async def confirm_natural_callback(
         unit_ids=_unit_ids(data),
         granularity=Granularity(str(data.get("granularity") or Granularity.TOTAL.value)),
         sales_channel_choice=str(data.get("sales_channel_choice") or "") or None,
+        vat_mode=str(data.get("vat_mode") or "") or None,
+        vat_rate=str(data.get("vat_rate") or "") or None,
     )
     if result.status == "needs_clarification":
         await state.set_state(ReportForm.clarification)
@@ -331,11 +386,48 @@ async def make_repeating_callback(
 ) -> None:
     """Convert current report settings to a repeating report."""
     await callback.answer()
-    data = await state.get_data()
     if not callback.message:
         await state.clear()
         return
+    await _start_repeating_report(callback.message, state, bot_report_service)
 
+
+@router.message(ReportForm.ask_make_repeating, F.text)
+async def answer_make_repeating(
+    message: Message,
+    state: FSMContext,
+    telegram_user: TelegramUser,
+    bot_report_service: BotReportService,
+) -> None:
+    """Treat anything other than an answer as a decline plus a new request."""
+    answer = (message.text or "").strip().casefold()
+    if answer in REPEAT_CONFIRM_WORDS:
+        await _start_repeating_report(message, state, bot_report_service)
+        return
+    await state.clear()
+    if not answer or answer in REPEAT_DECLINE_WORDS:
+        await message.answer(SINGLE_REPORT_KEPT, reply_markup=main_menu())
+        return
+    await _start_new_report(message, state, telegram_user, bot_report_service)
+
+
+@router.callback_query(F.data == "report:skip_repeating")
+async def skip_repeating_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    """Decline the repeat question without cancelling whatever runs now."""
+    await callback.answer()
+    if await state.get_state() != ReportForm.ask_make_repeating.state:
+        return
+    await state.clear()
+    if callback.message:
+        await callback.message.answer(SINGLE_REPORT_KEPT, reply_markup=main_menu())
+
+
+async def _start_repeating_report(
+    message: Message,
+    state: FSMContext,
+    bot_report_service: BotReportService,
+) -> None:
+    data = await state.get_data()
     preparation = data.get("preparation") or {}
     report_types = list(preparation.get("report_types") or [])
     metric_id = next(
@@ -344,7 +436,7 @@ async def make_repeating_callback(
     )
     if not metric_id:
         await state.clear()
-        await callback.message.answer(
+        await message.answer(
             "Не удалось определить тип отчёта для повторения.",
             reply_markup=main_menu(),
         )
@@ -375,7 +467,7 @@ async def make_repeating_callback(
         from_one_time_report=True,
     )
 
-    await callback.message.answer(
+    await message.answer(
         "Как часто присылать отчёт?",
         reply_markup=keyboard(
             [
@@ -470,6 +562,8 @@ async def confirm_report(
         unit_ids=_unit_ids(data),
         granularity=Granularity(str(data.get("granularity") or Granularity.TOTAL.value)),
         sales_channel_choice=str(data.get("sales_channel_choice") or "") or None,
+        vat_mode=str(data.get("vat_mode") or "") or None,
+        vat_rate=str(data.get("vat_rate") or "") or None,
     )
     if result.status == "needs_clarification":
         await state.update_data(source_query=query)
@@ -489,6 +583,15 @@ async def confirm_report(
 
 @router.message(StateFilter(None), F.text)
 async def natural_language_report(
+    message: Message,
+    state: FSMContext,
+    telegram_user: TelegramUser,
+    bot_report_service: BotReportService,
+) -> None:
+    await _start_new_report(message, state, telegram_user, bot_report_service)
+
+
+async def _start_new_report(
     message: Message,
     state: FSMContext,
     telegram_user: TelegramUser,
@@ -600,6 +703,18 @@ async def _advance_natural_flow(
             sales_channel_choice=selected_channel,
             sales_channel_label=label,
         )
+
+    data = await state.get_data()
+    if _has_monetary_metrics(data, service):
+        if not data.get("vat_mode"):
+            await state.set_state(ReportForm.choosing_vat_mode)
+            await message.answer(VAT_MODE_PROMPT, reply_markup=vat_mode_keyboard("report"))
+            return
+
+        if data.get("vat_mode") == "with_vat" and not data.get("vat_rate"):
+            await state.set_state(ReportForm.choosing_vat_rate)
+            await message.answer(VAT_RATE_PROMPT, reply_markup=vat_rate_keyboard("report"))
+            return
 
     if not data.get("output_format"):
         prepared_format = str(preparation.get("output_format") or "")
@@ -741,7 +856,7 @@ async def _ask_make_repeating(message: Message, state: FSMContext) -> None:
         reply_markup=keyboard(
             [
                 [("🔄 Сделать повторяющимся", "report:make_repeating")],
-                [("Нет, спасибо", "report:cancel")],
+                [("Нет, спасибо", "report:skip_repeating")],
             ]
         ),
     )
@@ -781,6 +896,15 @@ def _confirmation_text(data: dict[str, Any]) -> str:
             else sales_channel_label(channel_choice)
         )
         lines.append(f"Каналы продаж: {channel_label}")
+    vat_mode = str(data.get("vat_mode") or "")
+    if vat_mode:
+        vat_label = data.get("vat_mode_label") or VAT_MODE_LABELS.get(vat_mode, vat_mode)
+        if vat_mode == "with_vat":
+            vat_rate = str(data.get("vat_rate") or "")
+            vat_rate_label = data.get("vat_rate_label") or VAT_RATE_LABELS.get(vat_rate, vat_rate)
+            lines.append(f"НДС: {vat_label} ({vat_rate_label})")
+        else:
+            lines.append(f"НДС: {vat_label}")
     output_format = str(data.get("output_format") or "")
     lines.append(f"Формат: {FORMAT_LABELS.get(output_format, output_format)}")
     return "\n".join(lines)
@@ -801,6 +925,16 @@ def _now_timestamp() -> float:
 def _unit_ids(data: dict[str, Any]) -> list[str]:
     values = data.get("unit_ids") or []
     return [str(item) for item in values]
+
+
+def _has_monetary_metrics(data: dict[str, Any], service: BotReportService) -> bool:
+    """Check if the report contains any monetary metrics."""
+    preparation = data.get("preparation") or {}
+    report_types = list(preparation.get("report_types") or [])
+    return any(
+        service.metrics.has(report_type) and service.metrics.is_monetary(report_type)
+        for report_type in report_types
+    )
 
 
 def _unit_labels(data: dict[str, Any]) -> dict[str, str]:

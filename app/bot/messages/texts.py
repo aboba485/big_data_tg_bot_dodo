@@ -9,6 +9,7 @@ HELP_TEXT = (
     "Команды:\n"
     "/start — открыть главное меню\n"
     "/help — показать эту справку\n"
+    "/metrics — показать все доступные метрики\n"
     "/schedules — настроить повторяющиеся отчёты\n"
     "/drive — подключить Google Drive для выгрузки в Google Sheets\n"
     "/cancel — отменить текущий диалог\n\n"
@@ -59,3 +60,11 @@ ACCESS_DENIED = (
 GENERIC_ERROR = (
     "Произошла ошибка при формировании отчёта.\nПричина: {reason}\nКод ошибки: {error_code}"
 )
+
+METRICS_HEADER = "📊 Доступные метрики\n\n"
+
+NO_METRICS_AVAILABLE = "У вас нет доступа ни к одной метрике."
+
+VAT_MODE_PROMPT = "Показать суммы с НДС или без НДС?"
+
+VAT_RATE_PROMPT = "Какая ставка НДС?"

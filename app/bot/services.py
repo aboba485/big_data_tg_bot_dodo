@@ -40,7 +40,7 @@ from app.planner.schemas import (
 from app.planner.service import PlannerService
 from app.planner.validator import ReportPlanValidator
 from app.report_service import ReportOrchestrator
-from app.reports.exporters import export_csv
+from app.reports.exporters import export_csv, export_xlsx
 from app.reports.matrix import (
     TOTAL_LABEL,
     build_matrix,
@@ -48,6 +48,7 @@ from app.reports.matrix import (
     period_label_from_dates,
 )
 from app.reports.metric_registry import MetricRegistry
+from app.reports.vat import VatOptions, apply_vat_to_aggregated_data
 from app.retrieval.normalizer import normalize_query
 from app.retrieval.service import RetrievalService
 from app.storage.generated_files import GeneratedFileRepository
@@ -280,8 +281,9 @@ class BotReportService:
             raise BotAccessError(str(exc)) from exc
         has_all_units_phrase = bool(ALL_UNITS_PHRASE_RE.search(normalize_query(query)))
         mentioned_city_units = []
+        city_was_attempted = False
         if defer_units and not mentioned_units and has_all_units_phrase:
-            mentioned_city_units = self._mentioned_city_unit_ids(user, query)
+            mentioned_city_units, city_was_attempted = self._mentioned_city_unit_ids_with_attempt(user, query)
         units_specified = bool(mentioned_units or mentioned_city_units)
 
         candidates = await self.retrieval.search_endpoints(query)
@@ -386,8 +388,15 @@ class BotReportService:
             unit_ids = mentioned_city_units
             plan.unit_references = unit_ids
         elif defer_units and has_all_units_phrase:
-            plan.unit_references = []
-            unit_ids = []
+            # Select all available units when user says "все заведения/пиццерии"
+            # but only if no city was mentioned (even if unknown)
+            if city_was_attempted:
+                plan.unit_references = []
+                unit_ids = []
+            else:
+                unit_ids = [unit_id for unit_id, _label in self.available_units(user)]
+                plan.unit_references = unit_ids
+                units_specified = True  # Mark as specified so handlers don't ask for units
         elif plan.unit_references or self.orchestrator.needs_units(plan):
             try:
                 resolution = self.resolver.resolve(plan.unit_references)
@@ -512,13 +521,16 @@ class BotReportService:
         unit_ids: list[str] | None = None,
         granularity: Granularity | None = None,
         sales_channel_choice: str | None = None,
+        vat_mode: str | None = None,
+        vat_rate: str | None = None,
     ) -> BotReportResult:
         self._ensure_sheets_available(user, output_format)
         selected_units = list(dict.fromkeys(unit_ids or []))
         granularity_value = granularity.value if granularity is not None else ""
+        vat_fingerprint = f"{vat_mode or ''}\0{vat_rate or ''}"
         fingerprint = hashlib.sha256(
             f"{query}\0{output_format.value}\0{','.join(sorted(selected_units))}\0"
-            f"{granularity_value}\0{sales_channel_choice or ''}".encode()
+            f"{granularity_value}\0{sales_channel_choice or ''}\0{vat_fingerprint}".encode()
         ).hexdigest()
         limit = self._user_limits[user.telegram_id]
         if fingerprint in self._in_flight[user.telegram_id] or limit.locked():
@@ -588,7 +600,12 @@ class BotReportService:
                 except TimeoutError as exc:
                     raise BotBusyError("Формирование отчёта превысило допустимое время.") from exc
                 result = await self._result_from_response(
-                    response, output_format=output_format, telegram_id=user.telegram_id
+                    response,
+                    output_format=output_format,
+                    telegram_id=user.telegram_id,
+                    vat_mode=vat_mode,
+                    vat_rate=vat_rate,
+                    report_types=report_types,
                 )
                 final_status = result.status
                 return result
@@ -696,6 +713,9 @@ class BotReportService:
         *,
         output_format: OutputFormat,
         telegram_id: int,
+        vat_mode: str | None = None,
+        vat_rate: str | None = None,
+        report_types: list[str] | None = None,
     ) -> BotReportResult:
         status = str(response.get("status", "unsupported"))
         if status != "ready":
@@ -705,11 +725,36 @@ class BotReportService:
                 reason=response.get("reason"),
                 response=response,
             )
+        vat_applied = False
+        if vat_mode and report_types:
+            vat_options = (
+                VatOptions(
+                    mode=vat_mode,
+                    rate=int(vat_rate) if vat_rate else None,
+                )
+                if vat_mode == "with_vat"
+                else VatOptions(mode=vat_mode)
+            )
+            rows = response.get("rows") or []
+            transformed_rows = apply_vat_to_aggregated_data(
+                rows, report_types, vat_options, self.metrics
+            )
+            response = {**response, "rows": transformed_rows}
+            totals = response.get("totals")
+            if totals:
+                transformed_totals = apply_vat_to_aggregated_data(
+                    [totals], report_types, vat_options, self.metrics
+                )
+                new_totals = transformed_totals[0] if transformed_totals else totals
+                response = {**response, "totals": new_totals}
+            vat_applied = vat_options.mode == "with_vat"
         full_text = self._format_response_text(response)
         text = self._truncate_response(full_text)
         if output_format == OutputFormat.SHEETS:
             return await self._sheet_result(response, full_text, telegram_id)
         download = response.get("download")
+        if download and vat_applied:
+            self._rewrite_download(download, response)
         if not download and (
             len(response.get("rows") or []) > self.settings.telegram_max_message_rows
             or len(full_text) > 4000
@@ -929,16 +974,27 @@ class BotReportService:
         return choices[0] if len(choices) == 1 else None
 
     def _mentioned_city_unit_ids(self, user: TelegramUser, query: str) -> list[str]:
+        unit_ids, _city_was_attempted = self._mentioned_city_unit_ids_with_attempt(user, query)
+        return unit_ids
+
+    def _mentioned_city_unit_ids_with_attempt(self, user: TelegramUser, query: str) -> tuple[list[str], bool]:
+        """Return (unit_ids, city_was_attempted) - city_was_attempted is True if query contains city context."""
         normalized = normalize_query(query)
         if not ALL_UNITS_PHRASE_RE.search(normalized):
-            return []
+            return [], False
+        # Check if query contains city context: prepositions like "в/по Москве" or genitive after "заведениям"
+        # Pattern: "всем заведениям [Capitalized word]" or "в/по [Capitalized word]"
+        city_was_attempted = bool(
+            re.search(r'(?:заведени\w+|пиццери\w+|ресторан\w+)\s+[А-ЯЁ][а-яё]+', query) or
+            re.search(r'\b(?:в|по)\s+[А-ЯЁ][а-яё]+', query)
+        )
         padded_query = f" {normalized} "
         result: list[str] = []
         for city in self.available_unit_cities(user):
             variants = self._city_query_variants(normalize_query(city.label))
             if any(f" {variant} " in padded_query for variant in variants):
                 result.extend(unit_id for unit_id, _label in city.units)
-        return list(dict.fromkeys(result))
+        return list(dict.fromkeys(result)), city_was_attempted
 
     @staticmethod
     def _city_query_variants(city: str) -> set[str]:
@@ -1087,6 +1143,20 @@ class BotReportService:
         if not path.is_file():
             raise BotInputError("Файл отчёта не найден.")
         return path, media_type
+
+    def _rewrite_download(self, download: dict[str, Any], response: dict[str, Any]) -> None:
+        report_id = str(download.get("report_id") or "")
+        if not report_id:
+            return
+        path, media_type = self._resolve_file(report_id)
+        columns = list(response.get("columns") or [])
+        rows = list(response.get("rows") or [])
+        totals = dict(response.get("totals") or {})
+        period_label = self._period_label(response)
+        if path.suffix.lower() == ".xlsx" or "spreadsheetml" in media_type:
+            export_xlsx(path, columns, rows, totals, period_label=period_label)
+            return
+        export_csv(path, columns, rows, totals, period_label=period_label)
 
     def _create_overflow_csv(self, response: dict[str, Any]) -> dict[str, str]:
         report_id = uuid.uuid4().hex

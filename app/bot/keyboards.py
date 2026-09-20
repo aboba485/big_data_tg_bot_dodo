@@ -20,6 +20,7 @@ def main_menu() -> InlineKeyboardMarkup:
     return keyboard(
         [
             [("❓ Помощь", "help:show")],
+            [("📊 Доступные метрики", "metrics:show")],
             [("🔄 Повторяющиеся отчёты", "weekly:list")],
             [("☁️ Google Drive", "drive:show")],
         ]
@@ -81,6 +82,16 @@ GRANULARITY_LABELS = {
     "month": "По месяцам",
 }
 
+VAT_MODE_LABELS = {
+    "with_vat": "С НДС",
+    "without_vat": "Без НДС",
+}
+
+VAT_RATE_LABELS = {
+    "10": "10%",
+    "22": "22%",
+}
+
 
 def granularity_keyboard(
     prefix: str,
@@ -92,6 +103,18 @@ def granularity_keyboard(
         for value, label in GRANULARITY_LABELS.items()
         if value in allowed
     ]
+    rows.append([("Отмена", f"{prefix}:cancel")])
+    return keyboard(rows)
+
+
+def vat_mode_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    rows = [[(label, f"{prefix}:vat_mode:{value}")] for value, label in VAT_MODE_LABELS.items()]
+    rows.append([("Отмена", f"{prefix}:cancel")])
+    return keyboard(rows)
+
+
+def vat_rate_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    rows = [[(label, f"{prefix}:vat_rate:{value}")] for value, label in VAT_RATE_LABELS.items()]
     rows.append([("Отмена", f"{prefix}:cancel")])
     return keyboard(rows)
 

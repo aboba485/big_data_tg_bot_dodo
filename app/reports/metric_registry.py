@@ -48,6 +48,7 @@ class MetricDefinition(BaseModel):
     required_fields: list[str] = Field(default_factory=list)
     granularities: list[str] = Field(default_factory=list)
     groups: list[str] = Field(default_factory=list)
+    value_kind: str | None = None
 
     @model_validator(mode="after")
     def validate_formula(self) -> MetricDefinition:
@@ -135,6 +136,12 @@ class MetricRegistry:
 
     def aliases(self) -> dict[str, list[str]]:
         return self._aliases
+
+    def is_monetary(self, metric_id: str) -> bool:
+        """Check if a metric represents monetary values."""
+        if metric_id not in self._metrics:
+            return False
+        return self._metrics[metric_id].value_kind == "money"
 
     def match_aliases(self, normalized_query: str) -> list[str]:
         query_tokens = normalized_query.split()
