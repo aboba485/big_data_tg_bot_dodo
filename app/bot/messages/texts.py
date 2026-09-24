@@ -66,5 +66,3 @@ METRICS_HEADER = "📊 Доступные метрики\n\n"
 NO_METRICS_AVAILABLE = "У вас нет доступа ни к одной метрике."
 
 VAT_MODE_PROMPT = "Показать суммы с НДС или без НДС?"
-
-VAT_RATE_PROMPT = "Какая ставка НДС?"

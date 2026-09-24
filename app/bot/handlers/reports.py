@@ -13,7 +13,6 @@ from app.bot.keyboards import (
     FORMAT_LABELS,
     GRANULARITY_LABELS,
     VAT_MODE_LABELS,
-    VAT_RATE_LABELS,
     allowed_formats,
     format_keyboard,
     granularity_keyboard,
@@ -23,9 +22,8 @@ from app.bot.keyboards import (
     unit_cities_keyboard,
     units_multiselect_keyboard,
     vat_mode_keyboard,
-    vat_rate_keyboard,
 )
-from app.bot.messages.texts import DRIVE_NOT_LINKED, HELP_TEXT, VAT_MODE_PROMPT, VAT_RATE_PROMPT
+from app.bot.messages.texts import DRIVE_NOT_LINKED, HELP_TEXT, VAT_MODE_PROMPT
 from app.bot.models import BotPreparation
 from app.bot.services import BotReportService
 from app.bot.states.reports import ReportForm, ScheduledReportForm
@@ -289,23 +287,6 @@ async def choose_vat_mode_callback(
     await _advance_natural_flow(callback.message, state, telegram_user, bot_report_service)
 
 
-@router.callback_query(ReportForm.choosing_vat_rate, F.data.startswith("report:vat_rate:"))
-async def choose_vat_rate_callback(
-    callback: CallbackQuery,
-    state: FSMContext,
-    telegram_user: TelegramUser,
-    bot_report_service: BotReportService,
-) -> None:
-    await callback.answer()
-    await _ensure_active(state, bot_report_service)
-    choice = (callback.data or "").removeprefix("report:vat_rate:")
-    if choice not in VAT_RATE_LABELS:
-        raise BotInputError("Недопустимая ставка НДС.")
-    label = VAT_RATE_LABELS[choice]
-    await state.update_data(vat_rate=choice, vat_rate_label=label)
-    await _advance_natural_flow(callback.message, state, telegram_user, bot_report_service)
-
-
 @router.callback_query(ReportForm.choosing_format, F.data.startswith("report:format:"))
 async def choose_format_callback(
     callback: CallbackQuery,
@@ -353,7 +334,6 @@ async def confirm_natural_callback(
         granularity=Granularity(str(data.get("granularity") or Granularity.TOTAL.value)),
         sales_channel_choice=str(data.get("sales_channel_choice") or "") or None,
         vat_mode=str(data.get("vat_mode") or "") or None,
-        vat_rate=str(data.get("vat_rate") or "") or None,
     )
     if result.status == "needs_clarification":
         await state.set_state(ReportForm.clarification)
@@ -563,7 +543,6 @@ async def confirm_report(
         granularity=Granularity(str(data.get("granularity") or Granularity.TOTAL.value)),
         sales_channel_choice=str(data.get("sales_channel_choice") or "") or None,
         vat_mode=str(data.get("vat_mode") or "") or None,
-        vat_rate=str(data.get("vat_rate") or "") or None,
     )
     if result.status == "needs_clarification":
         await state.update_data(source_query=query)
@@ -705,15 +684,17 @@ async def _advance_natural_flow(
         )
 
     data = await state.get_data()
-    if _has_monetary_metrics(data, service):
-        if not data.get("vat_mode"):
+    if _has_monetary_metrics(data, service) and not data.get("vat_mode"):
+        explicit_vat = service._explicit_vat_mode(str(data.get("source_query") or ""))
+        if explicit_vat:
+            await state.update_data(
+                vat_mode=explicit_vat,
+                vat_mode_label=VAT_MODE_LABELS[explicit_vat],
+            )
+            data = await state.get_data()
+        else:
             await state.set_state(ReportForm.choosing_vat_mode)
             await message.answer(VAT_MODE_PROMPT, reply_markup=vat_mode_keyboard("report"))
-            return
-
-        if data.get("vat_mode") == "with_vat" and not data.get("vat_rate"):
-            await state.set_state(ReportForm.choosing_vat_rate)
-            await message.answer(VAT_RATE_PROMPT, reply_markup=vat_rate_keyboard("report"))
             return
 
     if not data.get("output_format"):
@@ -899,12 +880,7 @@ def _confirmation_text(data: dict[str, Any]) -> str:
     vat_mode = str(data.get("vat_mode") or "")
     if vat_mode:
         vat_label = data.get("vat_mode_label") or VAT_MODE_LABELS.get(vat_mode, vat_mode)
-        if vat_mode == "with_vat":
-            vat_rate = str(data.get("vat_rate") or "")
-            vat_rate_label = data.get("vat_rate_label") or VAT_RATE_LABELS.get(vat_rate, vat_rate)
-            lines.append(f"НДС: {vat_label} ({vat_rate_label})")
-        else:
-            lines.append(f"НДС: {vat_label}")
+        lines.append(f"НДС: {vat_label}")
     output_format = str(data.get("output_format") or "")
     lines.append(f"Формат: {FORMAT_LABELS.get(output_format, output_format)}")
     return "\n".join(lines)

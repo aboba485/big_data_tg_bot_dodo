@@ -22,7 +22,6 @@ from app.bot.handlers.reports import (
     choose_granularity_callback,
     choose_sales_channel_callback,
     choose_vat_mode_callback,
-    choose_vat_rate_callback,
     clarify_report,
     confirm_report,
     make_repeating_callback,
@@ -32,9 +31,9 @@ from app.bot.handlers.reports import (
     units_action_callback,
 )
 from app.bot.handlers.reports import router as reports_router
-from app.bot.keyboards import sales_channel_keyboard
+from app.bot.keyboards import sales_channel_keyboard, vat_mode_keyboard
 from app.bot.models import BotPreparation, BotReportResult
-from app.bot.services import UnitCity
+from app.bot.services import BotReportService, UnitCity
 from app.bot.states.reports import ReportForm, ScheduledReportForm
 from app.planner.schemas import Granularity, OutputFormat
 from app.users.models import TelegramUser
@@ -131,6 +130,7 @@ def _ready_service(**extra) -> SimpleNamespace:
         ),
         "run": AsyncMock(return_value=BotReportResult(status="ready", text="Готово")),
         "sheets_available": lambda _user: False,
+        "_explicit_vat_mode": BotReportService._explicit_vat_mode,
     }
     values.update(extra)
     return SimpleNamespace(**values)
@@ -362,8 +362,8 @@ async def test_vat_mode_without_vat_moves_to_format() -> None:
 
 
 @pytest.mark.asyncio
-async def test_vat_mode_with_vat_moves_to_rate_selection() -> None:
-    """Choosing 'with VAT' should ask for the VAT rate."""
+async def test_vat_mode_with_vat_moves_to_format() -> None:
+    """Choosing 'with VAT' should skip rate selection and go to format."""
     state = FakeState(
         data={
             "started_at": 10**20,
@@ -380,34 +380,9 @@ async def test_vat_mode_with_vat_moves_to_rate_selection() -> None:
 
     await choose_vat_mode_callback(callback, state, _user(), service)  # type: ignore[arg-type]
 
-    assert state.state == ReportForm.choosing_vat_rate
-    assert state.data["vat_mode"] == "with_vat"
-    assert "ставка" in callback.message.answers[-1][0].casefold()
-
-
-@pytest.mark.asyncio
-async def test_vat_rate_selection_moves_to_format() -> None:
-    """Selecting a VAT rate should move to format selection."""
-    state = FakeState(
-        data={
-            "started_at": 10**20,
-            "preparation": {"report_types": ["sales"]},
-            "unit_ids": ["unit-1"],
-            "unit_labels": {"unit-1": "Ресторан 1"},
-            "granularity": "day",
-            "granularity_label": "По дням",
-            "vat_mode": "with_vat",
-            "vat_mode_label": "С НДС",
-        },
-        state=ReportForm.choosing_vat_rate,
-    )
-    service = _ready_service()
-    callback = FakeCallback(data="report:vat_rate:22")
-
-    await choose_vat_rate_callback(callback, state, _user(), service)  # type: ignore[arg-type]
-
     assert state.state == ReportForm.choosing_format
-    assert state.data["vat_rate"] == "22"
+    assert state.data["vat_mode"] == "with_vat"
+    assert "vat_rate" not in state.data
     assert "формат" in callback.message.answers[-1][0].casefold()
 
 
@@ -466,6 +441,21 @@ def test_sales_channel_keyboard_has_flat_button_rows(prefix: str, can_split: boo
     assert callbacks == expected
 
 
+def test_vat_mode_keyboard_has_no_rate_buttons() -> None:
+    markup = vat_mode_keyboard("report")
+    texts = [row[0].text for row in markup.inline_keyboard]
+    callbacks = [row[0].callback_data for row in markup.inline_keyboard]
+
+    assert texts == ["С НДС", "Без НДС", "Отмена"]
+    assert callbacks == [
+        "report:vat_mode:with_vat",
+        "report:vat_mode:without_vat",
+        "report:cancel",
+    ]
+    assert not any("10" in text or "22" in text for text in texts)
+    assert not any("vat_rate" in (callback or "") for callback in callbacks)
+
+
 @pytest.mark.asyncio
 async def test_channel_choice_moves_to_vat_for_monetary_metrics() -> None:
     """Channel selection should move to VAT mode for monetary metrics."""
@@ -520,6 +510,33 @@ async def test_complete_natural_request_skips_redundant_choices_for_monetary() -
     assert state.state == ReportForm.choosing_vat_mode
     assert state.data["granularity"] == "day"
     # output_format is set later in the flow after VAT selection
+
+
+@pytest.mark.asyncio
+async def test_natural_request_with_nds_skips_vat_prompt() -> None:
+    state = FakeState()
+    service = _ready_service(
+        prepare=AsyncMock(
+            return_value=BotPreparation(
+                status="ready",
+                report_types=["sales"],
+                unit_ids=["unit-1"],
+                units_specified=True,
+                granularity=Granularity.DAY,
+                output_format=OutputFormat.CSV,
+                granularity_specified=True,
+                output_format_specified=True,
+            )
+        )
+    )
+
+    message = FakeMessage(text="Выручка Ресторан 1 за июнь 2026 по дням в CSV с НДС")
+    await natural_language_report(message, state, _user(), service)  # type: ignore[arg-type]
+
+    assert state.state == ReportForm.confirming
+    assert state.data["vat_mode"] == "with_vat"
+    assert "НДС: С НДС" in message.answers[-1][0]
+    assert not any("с ндс или без" in text.casefold() for text, _markup in message.answers)
 
 
 @pytest.mark.asyncio
@@ -585,7 +602,6 @@ async def test_text_only_flow_reaches_confirmation_and_delivers_report() -> None
             "granularity_label": "По неделям",
             "vat_mode": "without_vat",
             "vat_mode_label": "Без НДС",
-            "vat_rate": None,
             "preparation": {
                 "report_types": ["sales"],
                 "date_from": "2026-06-01",
@@ -614,7 +630,6 @@ async def test_text_only_flow_reaches_confirmation_and_delivers_report() -> None
         granularity=Granularity.WEEK,
         sales_channel_choice=None,
         vat_mode="without_vat",
-        vat_rate=None,
     )
     # Report delivered, then asked if user wants to make it repeating
     assert "Готово" in confirmation.answers[-2][0]

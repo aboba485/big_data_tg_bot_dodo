@@ -22,6 +22,7 @@ from app.documentation.models import EndpointCandidate
 from app.dodo.channels import (
     DEFAULT_SALES_CHANNELS,
     SALES_CHANNEL_FILTER,
+    SALES_CHANNEL_GROUP,
     canonical_sales_channel,
     sales_channel_intent,
     sales_channel_label,
@@ -48,7 +49,12 @@ from app.reports.matrix import (
     period_label_from_dates,
 )
 from app.reports.metric_registry import MetricRegistry
-from app.reports.vat import VatOptions, apply_vat_to_aggregated_data
+from app.reports.vat import (
+    VatOptions,
+    apply_vat_to_aggregated_data,
+    collapse_channel_rows,
+    sum_metric_totals,
+)
 from app.retrieval.normalizer import normalize_query
 from app.retrieval.service import RetrievalService
 from app.storage.generated_files import GeneratedFileRepository
@@ -74,6 +80,16 @@ UUID_RE = re.compile(
     r"\b[0-9a-fA-F]{32}\b|\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b"
 )
 ALL_UNITS_PHRASE_RE = re.compile(r"\b(?:все|всем|всех)\s+(?:заведени\w*|ресторан\w*|пиццери\w*)\b")
+VAT_MODE_PATTERNS = (
+    (
+        "with_vat",
+        re.compile(r"\b(?:с|со|включая)\s+ндс\b|\bwith\s+(?:vat|nds)\b|\bincluding\s+vat\b"),
+    ),
+    (
+        "without_vat",
+        re.compile(r"\bбез\s+(?:ндс|vat|nds)\b|\bwithout\s+(?:vat|nds)\b|\bexcluding\s+vat\b"),
+    ),
+)
 GRANULARITY_PATTERNS = (
     (Granularity.HOUR, re.compile(r"\b(?:по\s+час\w*|почасов\w*|hourly)\b")),
     (Granularity.DAY, re.compile(r"\b(?:по\s+дн\w*|daily)\b")),
@@ -283,7 +299,9 @@ class BotReportService:
         mentioned_city_units = []
         city_was_attempted = False
         if defer_units and not mentioned_units and has_all_units_phrase:
-            mentioned_city_units, city_was_attempted = self._mentioned_city_unit_ids_with_attempt(user, query)
+            mentioned_city_units, city_was_attempted = self._mentioned_city_unit_ids_with_attempt(
+                user, query
+            )
         units_specified = bool(mentioned_units or mentioned_city_units)
 
         candidates = await self.retrieval.search_endpoints(query)
@@ -522,15 +540,13 @@ class BotReportService:
         granularity: Granularity | None = None,
         sales_channel_choice: str | None = None,
         vat_mode: str | None = None,
-        vat_rate: str | None = None,
     ) -> BotReportResult:
         self._ensure_sheets_available(user, output_format)
         selected_units = list(dict.fromkeys(unit_ids or []))
         granularity_value = granularity.value if granularity is not None else ""
-        vat_fingerprint = f"{vat_mode or ''}\0{vat_rate or ''}"
         fingerprint = hashlib.sha256(
             f"{query}\0{output_format.value}\0{','.join(sorted(selected_units))}\0"
-            f"{granularity_value}\0{sales_channel_choice or ''}\0{vat_fingerprint}".encode()
+            f"{granularity_value}\0{sales_channel_choice or ''}\0{vat_mode or ''}".encode()
         ).hexdigest()
         limit = self._user_limits[user.telegram_id]
         if fingerprint in self._in_flight[user.telegram_id] or limit.locked():
@@ -590,9 +606,17 @@ class BotReportService:
                             self.user_access.ensure_unit_access(current_user, context.unit_ids)
                         except PermissionError as exc:
                             raise BotAccessError(str(exc)) from exc
+                        default_channel = None
+                        collapse_channels = False
+                        plan, default_channel, collapse_channels = self._vat_execution_plan(
+                            context.plan,
+                            sales_channel_choice,
+                            vat_mode,
+                            report_types,
+                        )
                         response = await self.orchestrator.create_prepared_report(
                             query,
-                            context.plan,
+                            plan,
                             context.unit_ids,
                             context.planner_result,
                             context.candidates,
@@ -604,8 +628,9 @@ class BotReportService:
                     output_format=output_format,
                     telegram_id=user.telegram_id,
                     vat_mode=vat_mode,
-                    vat_rate=vat_rate,
                     report_types=report_types,
+                    default_channel=default_channel,
+                    collapse_channels=collapse_channels,
                 )
                 final_status = result.status
                 return result
@@ -714,8 +739,9 @@ class BotReportService:
         output_format: OutputFormat,
         telegram_id: int,
         vat_mode: str | None = None,
-        vat_rate: str | None = None,
         report_types: list[str] | None = None,
+        default_channel: str | None = None,
+        collapse_channels: bool = False,
     ) -> BotReportResult:
         status = str(response.get("status", "unsupported"))
         if status != "ready":
@@ -727,26 +753,35 @@ class BotReportService:
             )
         vat_applied = False
         if vat_mode and report_types:
-            vat_options = (
-                VatOptions(
-                    mode=vat_mode,
-                    rate=int(vat_rate) if vat_rate else None,
-                )
-                if vat_mode == "with_vat"
-                else VatOptions(mode=vat_mode)
+            vat_options = VatOptions(mode=vat_mode)
+            original_totals = dict(response.get("totals") or {})
+            rows = apply_vat_to_aggregated_data(
+                response.get("rows") or [],
+                report_types,
+                vat_options,
+                self.metrics,
+                default_channel=default_channel,
             )
-            rows = response.get("rows") or []
-            transformed_rows = apply_vat_to_aggregated_data(
-                rows, report_types, vat_options, self.metrics
-            )
-            response = {**response, "rows": transformed_rows}
-            totals = response.get("totals")
-            if totals:
-                transformed_totals = apply_vat_to_aggregated_data(
-                    [totals], report_types, vat_options, self.metrics
-                )
-                new_totals = transformed_totals[0] if transformed_totals else totals
-                response = {**response, "totals": new_totals}
+            columns = list(response.get("columns") or [])
+            if collapse_channels:
+                rows, columns = collapse_channel_rows(rows, columns, report_types)
+                plan = dict(response.get("plan") or {})
+                plan["group_by"] = [
+                    item for item in plan.get("group_by") or [] if item != SALES_CHANNEL_GROUP
+                ]
+                response = {**response, "plan": plan}
+            response = {**response, "rows": rows, "columns": columns}
+            if vat_options.mode == "with_vat":
+                response = {
+                    **response,
+                    "totals": self._vat_totals(
+                        original_totals,
+                        rows,
+                        report_types,
+                        vat_options,
+                        default_channel,
+                    ),
+                }
             vat_applied = vat_options.mode == "with_vat"
         full_text = self._format_response_text(response)
         text = self._truncate_response(full_text)
@@ -964,6 +999,12 @@ class BotReportService:
         return next(iter(matches)) if len(matches) == 1 else None
 
     @staticmethod
+    def _explicit_vat_mode(query: str) -> str | None:
+        normalized = normalize_query(query)
+        matches = {value for value, pattern in VAT_MODE_PATTERNS if pattern.search(normalized)}
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    @staticmethod
     def _explicit_sales_channel_choice(query: str) -> str | None:
         intent = sales_channel_intent(query)
         choices = list(intent.values)
@@ -977,16 +1018,16 @@ class BotReportService:
         unit_ids, _city_was_attempted = self._mentioned_city_unit_ids_with_attempt(user, query)
         return unit_ids
 
-    def _mentioned_city_unit_ids_with_attempt(self, user: TelegramUser, query: str) -> tuple[list[str], bool]:
-        """Return (unit_ids, city_was_attempted) - city_was_attempted is True if query contains city context."""
+    def _mentioned_city_unit_ids_with_attempt(
+        self, user: TelegramUser, query: str
+    ) -> tuple[list[str], bool]:
+        """Return unit ids and whether the query named a city after 'all units'."""
         normalized = normalize_query(query)
         if not ALL_UNITS_PHRASE_RE.search(normalized):
             return [], False
-        # Check if query contains city context: prepositions like "в/по Москве" or genitive after "заведениям"
-        # Pattern: "всем заведениям [Capitalized word]" or "в/по [Capitalized word]"
         city_was_attempted = bool(
-            re.search(r'(?:заведени\w+|пиццери\w+|ресторан\w+)\s+[А-ЯЁ][а-яё]+', query) or
-            re.search(r'\b(?:в|по)\s+[А-ЯЁ][а-яё]+', query)
+            re.search(r"(?:заведени\w+|пиццери\w+|ресторан\w+)\s+[А-ЯЁ][а-яё]+", query)
+            or re.search(r"\b(?:в|по)\s+[А-ЯЁ][а-яё]+", query)
         )
         padded_query = f" {normalized} "
         result: list[str] = []
@@ -1105,6 +1146,60 @@ class BotReportService:
         )
         context.planner_result.plan = plan
         return context
+
+    def _vat_execution_plan(
+        self,
+        plan: ReportPlan,
+        sales_channel_choice: str | None,
+        vat_mode: str | None,
+        report_types: list[str],
+    ) -> tuple[ReportPlan, str | None, bool]:
+        """Adjust the plan so combined VAT can be calculated per channel."""
+        if vat_mode != "with_vat":
+            return plan, None, False
+        choice = sales_channel_choice or ""
+        default_channel: str | None = None
+        if choice and choice not in {"all", "split"}:
+            default_channel = canonical_sales_channel(choice) or choice
+        elif report_types == ["delivery_sales"]:
+            default_channel = "Delivery"
+        channel_metrics = {"sales", "sales_by_channel"}
+        if choice in {"", "all"} and any(item in channel_metrics for item in report_types):
+            capability = self.validator.sales_channel_capability(plan)
+            if capability is not None and capability.can_group:
+                split_plan = plan.model_copy(deep=True)
+                self.validator.apply_sales_channel_choice(split_plan, "split")
+                collapse = "sales_by_channel" not in report_types
+                return split_plan, None, collapse
+        return plan, default_channel, False
+
+    def _is_sum_metric(self, metric_id: str) -> bool:
+        return self.metrics.has(metric_id) and self.metrics.get(metric_id).aggregation == "sum"
+
+    def _vat_totals(
+        self,
+        original_totals: dict[str, Any],
+        rows: list[dict[str, Any]],
+        report_types: list[str],
+        vat_options: VatOptions,
+        default_channel: str | None,
+    ) -> dict[str, Any]:
+        totals = dict(original_totals)
+        sum_ids = [metric_id for metric_id in report_types if self._is_sum_metric(metric_id)]
+        other_ids = [metric_id for metric_id in report_types if metric_id not in sum_ids]
+        totals.update(sum_metric_totals(rows, sum_ids))
+        if other_ids:
+            adjusted = apply_vat_to_aggregated_data(
+                [original_totals],
+                other_ids,
+                vat_options,
+                self.metrics,
+                default_channel=default_channel,
+            )
+            for metric_id in other_ids:
+                if metric_id in adjusted[0]:
+                    totals[metric_id] = adjusted[0][metric_id]
+        return totals
 
     def _sales_channel_preparation(
         self,

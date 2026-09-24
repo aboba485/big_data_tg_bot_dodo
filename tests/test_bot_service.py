@@ -319,7 +319,9 @@ async def test_all_available_units_selected_when_no_city_mentioned(settings) -> 
     service = _bot_service(settings)
     user = _viewer(units=[UNIT_ID])
 
-    preparation = await service.prepare(user, "Выручка за июнь 2026 по всем пиццериям", defer_units=True)
+    preparation = await service.prepare(
+        user, "Выручка за июнь 2026 по всем пиццериям", defer_units=True
+    )
 
     assert preparation.status == "ready"
     assert preparation.unit_ids == [UNIT_ID]
@@ -965,14 +967,14 @@ async def test_csv_download_is_rewritten_after_adding_vat(settings) -> None:
         output_format=OutputFormat.CSV,
         telegram_id=1,
         vat_mode="with_vat",
-        vat_rate="22",
         report_types=["sales"],
+        default_channel="Delivery",
     )
 
-    assert result.response["rows"][0]["sales"] == 1220.0
-    assert result.response["totals"]["sales"] == 1220.0
+    assert result.response["rows"][0]["sales"] == 1122.0
+    assert result.response["totals"]["sales"] == 1122.0
     text = path.read_text(encoding="utf-8-sig")
-    assert "1220" in text
+    assert "1122" in text
     assert "1000" not in text
 
 
@@ -1002,7 +1004,6 @@ async def test_csv_download_stays_net_without_vat(settings) -> None:
         output_format=OutputFormat.CSV,
         telegram_id=1,
         vat_mode="without_vat",
-        vat_rate=None,
         report_types=["sales"],
     )
 
@@ -1042,14 +1043,14 @@ async def test_xlsx_download_is_rewritten_after_adding_vat(settings) -> None:
         output_format=OutputFormat.XLSX,
         telegram_id=1,
         vat_mode="with_vat",
-        vat_rate="22",
         report_types=["sales"],
+        default_channel="Delivery",
     )
 
-    assert result.response["rows"][0]["sales"] == 1220.0
-    assert result.response["totals"]["sales"] == 1220.0
+    assert result.response["rows"][0]["sales"] == 1122.0
+    assert result.response["totals"]["sales"] == 1122.0
     values = [cell.value for row in load_workbook(path).active.iter_rows() for cell in row]
-    assert 1220.0 in values
+    assert 1122.0 in values
     assert 1000 not in values
     assert 1000.0 not in values
 
@@ -1080,17 +1081,17 @@ async def test_overflow_csv_uses_vat_adjusted_values(settings) -> None:
         output_format=OutputFormat.TABLE,
         telegram_id=1,
         vat_mode="with_vat",
-        vat_rate="22",
         report_types=["sales"],
+        default_channel="Delivery",
     )
 
-    assert result.response["rows"][0]["sales"] == 1220.0
-    assert result.response["rows"][1]["sales"] == 2440.0
+    assert result.response["rows"][0]["sales"] == 1122.0
+    assert result.response["rows"][1]["sales"] == 2244.0
     assert result.file_path is not None and result.file_path.is_file()
     text = result.file_path.read_text(encoding="utf-8-sig")
-    assert "1220" in text
-    assert "2440" in text
-    assert "3660" in text
+    assert "1122" in text
+    assert "2244" in text
+    assert "3366" in text
     assert "1000" not in text
     assert "2000" not in text
     assert "3000" not in text
@@ -1118,11 +1119,187 @@ async def test_sheets_upload_uses_vat_adjusted_rows(settings) -> None:
         output_format=OutputFormat.SHEETS,
         telegram_id=1,
         vat_mode="with_vat",
-        vat_rate="22",
         report_types=["sales"],
+        default_channel="Delivery",
     )
 
     assert result.sheet_url == "https://docs.google.com/spreadsheets/d/sheet-1"
     kwargs = service.google_drive.create_spreadsheet.await_args.kwargs
-    assert kwargs["rows"][0]["sales"] == 1220.0
-    assert kwargs["totals"]["sales"] == 1220.0
+    assert kwargs["rows"][0]["sales"] == 1122.0
+    assert kwargs["totals"]["sales"] == 1122.0
+
+
+@pytest.mark.asyncio
+async def test_combined_vat_collapses_channel_rows_after_per_channel_rates(settings) -> None:
+    service = _bot_service(settings)
+
+    result = await service._result_from_response(
+        {
+            "status": "ready",
+            "request_id": "request-id",
+            "columns": ["unitName", "salesChannel", "sales"],
+            "rows": [
+                {"unitName": "Unit", "salesChannel": "Delivery", "sales": 1000},
+                {"unitName": "Unit", "salesChannel": "Dine-in", "sales": 1000},
+            ],
+            "totals": {"sales": 2000},
+            "plan": {"metrics": ["sales"], "group_by": ["unit", "sales channel"]},
+        },
+        output_format=OutputFormat.TABLE,
+        telegram_id=1,
+        vat_mode="with_vat",
+        report_types=["sales"],
+        collapse_channels=True,
+    )
+
+    assert result.response["columns"] == ["unitName", "sales"]
+    assert result.response["rows"] == [{"unitName": "Unit", "sales": 2267.0}]
+    assert result.response["totals"]["sales"] == 2267.0
+    assert "sales channel" not in result.response["plan"]["group_by"]
+
+
+@pytest.mark.asyncio
+async def test_split_vat_keeps_per_channel_rows_with_channel_rates(settings) -> None:
+    service = _bot_service(settings)
+
+    result = await service._result_from_response(
+        {
+            "status": "ready",
+            "request_id": "request-id",
+            "columns": ["unitName", "salesChannel", "sales"],
+            "rows": [
+                {"unitName": "Unit", "salesChannel": "Delivery", "sales": 1000},
+                {"unitName": "Unit", "salesChannel": "Dine-in", "sales": 1000},
+                {"unitName": "Unit", "salesChannel": "Takeaway", "sales": 1000},
+                {"unitName": "Unit", "salesChannel": "Takeout", "sales": 1000},
+            ],
+            "totals": {"sales": 4000},
+            "plan": {"metrics": ["sales"], "group_by": ["unit", "sales channel"]},
+        },
+        output_format=OutputFormat.TABLE,
+        telegram_id=1,
+        vat_mode="with_vat",
+        report_types=["sales"],
+        collapse_channels=False,
+    )
+
+    assert result.response["columns"] == ["unitName", "salesChannel", "sales"]
+    assert result.response["rows"] == [
+        {"unitName": "Unit", "salesChannel": "Delivery", "sales": 1122.0},
+        {"unitName": "Unit", "salesChannel": "Dine-in", "sales": 1145.0},
+        {"unitName": "Unit", "salesChannel": "Takeaway", "sales": 1145.0},
+        {"unitName": "Unit", "salesChannel": "Takeout", "sales": 1145.0},
+    ]
+    assert result.response["totals"]["sales"] == 4557.0
+    assert "sales channel" in result.response["plan"]["group_by"]
+
+
+@pytest.mark.asyncio
+async def test_combined_sales_run_adds_channel_vat_then_sums(settings) -> None:
+    service = _bot_service(settings)
+    query = f"Покажи выручку за июнь 2026 по юниту {UNIT_ID}"
+    await service.prepare(_admin(), query, defer_units=True)
+
+    result = await service.run(
+        _admin(),
+        query,
+        OutputFormat.TABLE,
+        unit_ids=[UNIT_ID],
+        granularity=Granularity.TOTAL,
+        sales_channel_choice="all",
+        vat_mode="with_vat",
+    )
+
+    assert result.status == "ready"
+    assert "salesChannel" not in (result.response.get("columns") or [])
+    # 30 days * (6000 Delivery * 1.122 + 4000 Dine-in * 1.145)
+    assert result.response["totals"]["sales"] == 339360.0
+
+
+@pytest.mark.asyncio
+async def test_split_sales_run_keeps_channel_vat_rows(settings) -> None:
+    service = _bot_service(settings)
+    query = f"Покажи выручку за июнь 2026 по юниту {UNIT_ID}"
+    await service.prepare(_admin(), query, defer_units=True)
+
+    result = await service.run(
+        _admin(),
+        query,
+        OutputFormat.TABLE,
+        unit_ids=[UNIT_ID],
+        granularity=Granularity.TOTAL,
+        sales_channel_choice="split",
+        vat_mode="with_vat",
+    )
+
+    assert result.status == "ready"
+    assert "salesChannel" in (result.response.get("columns") or [])
+    by_channel = {row["salesChannel"]: row["sales"] for row in result.response["rows"]}
+    # 30 days * channel sales * channel rate
+    assert by_channel["Delivery"] == 201960.0
+    assert by_channel["Dine-in"] == 137400.0
+    assert result.response["totals"]["sales"] == 339360.0
+
+
+@pytest.mark.asyncio
+async def test_vat_does_not_sum_ratio_metric_totals(settings) -> None:
+    service = _bot_service(settings)
+
+    result = await service._result_from_response(
+        {
+            "status": "ready",
+            "request_id": "request-id",
+            "columns": ["unitName", "average_check"],
+            "rows": [
+                {"unitName": "Unit A", "average_check": 500},
+                {"unitName": "Unit B", "average_check": 500},
+            ],
+            "totals": {"average_check": 500},
+        },
+        output_format=OutputFormat.TABLE,
+        telegram_id=1,
+        vat_mode="with_vat",
+        report_types=["average_check"],
+        default_channel="Delivery",
+    )
+
+    assert result.response["rows"][0]["average_check"] == 561.0
+    assert result.response["rows"][1]["average_check"] == 561.0
+    assert result.response["totals"]["average_check"] == 561.0
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("Покажи выручку с НДС", "with_vat"),
+        ("Покажи выручку включая НДС", "with_vat"),
+        ("Show sales with VAT", "with_vat"),
+        ("Покажи выручку без НДС", "without_vat"),
+        ("Show sales without VAT", "without_vat"),
+        ("Покажи выручку", None),
+        ("Покажи выручку с НДС и без НДС", None),
+    ],
+)
+def test_explicit_vat_mode_from_query(settings, query: str, expected: str | None) -> None:
+    service = _bot_service(settings)
+    assert service._explicit_vat_mode(query) == expected
+
+
+def test_combined_sales_by_channel_stays_split_for_vat(settings) -> None:
+    service = _bot_service(settings)
+    plan = ReportPlan(
+        status=PlanStatus.READY,
+        metric_ids=["sales_by_channel"],
+        operation_ids=["get-finances-sales-daily-units"],
+        date_from=date(2026, 6, 1),
+        date_to=date(2026, 6, 30),
+        unit_references=[UNIT_ID],
+    )
+
+    new_plan, default_channel, collapse = service._vat_execution_plan(
+        plan, "all", "with_vat", ["sales_by_channel"]
+    )
+
+    assert collapse is False
+    assert default_channel is None
+    assert "sales channel" in new_plan.group_by
